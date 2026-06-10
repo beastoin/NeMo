@@ -66,6 +66,7 @@ class GPUWorker:
         self._stream_sessions: dict[str, dict] = {}
         self._next_stream_int_id = 1
         self._source_language = "English"
+        self._batch_poll_timeout = 0.05
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
@@ -132,7 +133,7 @@ class GPUWorker:
                 item = self._stream_queue.get_nowait()
             except queue.Empty:
                 try:
-                    item = self._batch_queue.get(timeout=0.05)
+                    item = self._batch_queue.get(timeout=self._batch_poll_timeout)
                 except queue.Empty:
                     continue
 
@@ -185,11 +186,19 @@ class GPUWorker:
 
         device = self._batch_cfg.get("device", "cuda:0")
 
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
+        log.info("Torch optimizations: cudnn.benchmark=True, matmul_precision=high")
+
         log.info(f"Loading batch model: {self._batch_cfg['name']}")
         self._batch_model = nemo_asr.models.ASRModel.from_pretrained(
             self._batch_cfg["name"], map_location=device
         )
         self._batch_model.eval()
+
+        torch.cuda.empty_cache()
+
         if self._batch_cfg.get("compile", False):
             log.info("Compiling batch model with torch.compile")
             self._batch_model = torch.compile(self._batch_model)

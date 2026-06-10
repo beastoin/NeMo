@@ -144,6 +144,42 @@ async def metrics():
     }
 
 
+@app.get("/admin/config")
+async def get_tuning():
+    """Get current tunable parameters."""
+    return {
+        "max_batch_size": batch_engine._max_batch_size if batch_engine else None,
+        "max_wait_seconds": batch_engine._max_wait_seconds if batch_engine else None,
+        "max_queue_depth": batch_engine._max_queue_depth if batch_engine else None,
+        "gpu_poll_timeout": gpu_worker._batch_poll_timeout if gpu_worker else None,
+    }
+
+
+@app.post("/admin/config")
+async def set_tuning(
+    max_batch_size: Optional[int] = Query(None, ge=1, le=256),
+    max_wait_seconds: Optional[float] = Query(None, ge=0.001, le=5.0),
+    max_queue_depth: Optional[int] = Query(None, ge=16, le=8192),
+    gpu_poll_timeout: Optional[float] = Query(None, ge=0.001, le=1.0),
+):
+    """Live-tune server parameters without restart."""
+    changes = {}
+    if max_batch_size is not None:
+        batch_engine._max_batch_size = max_batch_size
+        changes["max_batch_size"] = max_batch_size
+    if max_wait_seconds is not None:
+        batch_engine._max_wait_seconds = max_wait_seconds
+        changes["max_wait_seconds"] = max_wait_seconds
+    if max_queue_depth is not None:
+        batch_engine._max_queue_depth = max_queue_depth
+        changes["max_queue_depth"] = max_queue_depth
+    if gpu_poll_timeout is not None:
+        gpu_worker._batch_poll_timeout = gpu_poll_timeout
+        changes["gpu_poll_timeout"] = gpu_poll_timeout
+    log.info(f"Config updated: {changes}")
+    return {"updated": changes}
+
+
 # --- Batch Transcription (Parakeet TDT) ---
 
 
