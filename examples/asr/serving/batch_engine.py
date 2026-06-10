@@ -1,0 +1,172 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Dynamic batching engine for offline ASR (Parakeet TDT).
+
+Collects incoming transcription requests and groups them into GPU-efficient
+batches. This is the key to high throughput: instead of processing one file
+per request, we wait a short time (max_wait_seconds) or until the batch is
+full (max_batch_size), then send the whole batch to the GPU worker.
+
+Architecture:
+    Client -> REST API -> BatchEngine.submit() -> accumulator queue
+                                                      |
+    GPU Worker <- flush_batch() (triggered by timer or full batch)
+                                                      |
+    Client <- asyncio.Future resolved with per-request result
+"""
+
+import asyncio
+import logging
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from gpu_worker import GPUWorker, WorkType
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingRequest:
+    audio_path: str
+    timestamps: bool
+    future: asyncio.Future
+    submitted_at: float = field(default_factory=time.monotonic)
+
+
+class BatchEngine:
+    """Dynamic batcher that accumulates requests and flushes to GPU."""
+
+    def __init__(
+        self,
+        gpu_worker: GPUWorker,
+        max_batch_size: int = 32,
+        max_wait_seconds: float = 0.1,
+        max_queue_depth: int = 256,
+    ):
+        self._gpu_worker = gpu_worker
+        self._max_batch_size = max_batch_size
+        self._max_wait_seconds = max_wait_seconds
+        self._max_queue_depth = max_queue_depth
+        self._pending: list[PendingRequest] = []
+        self._lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._metrics = {
+            "total_requests": 0,
+            "total_batches": 0,
+            "total_files": 0,
+            "rejected_requests": 0,
+        }
+
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._flush_task = asyncio.create_task(self._flush_loop())
+
+    async def stop(self) -> None:
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        if self._pending:
+            await self._flush_batch()
+
+    async def submit(self, audio_path: str, timestamps: bool = False) -> dict:
+        """Submit a file for transcription. Returns when the batch completes."""
+        async with self._lock:
+            if len(self._pending) >= self._max_queue_depth:
+                self._metrics["rejected_requests"] += 1
+                raise QueueFullError(
+                    f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}"
+                )
+
+            future = self._loop.create_future()
+            self._pending.append(PendingRequest(
+                audio_path=audio_path,
+                timestamps=timestamps,
+                future=future,
+            ))
+            self._metrics["total_requests"] += 1
+
+            if len(self._pending) >= self._max_batch_size:
+                asyncio.create_task(self._flush_batch())
+
+        return await future
+
+    async def _flush_loop(self) -> None:
+        """Periodically flush partial batches."""
+        while True:
+            await asyncio.sleep(self._max_wait_seconds)
+            if self._pending:
+                await self._flush_batch()
+
+    async def _flush_batch(self) -> None:
+        async with self._lock:
+            if not self._pending:
+                return
+            batch = self._pending[: self._max_batch_size]
+            self._pending = self._pending[self._max_batch_size:]
+
+        audio_paths = [r.audio_path for r in batch]
+        any_timestamps = any(r.timestamps for r in batch)
+
+        log.info(f"Flushing batch: {len(batch)} files")
+        self._metrics["total_batches"] += 1
+        self._metrics["total_files"] += len(batch)
+
+        try:
+            gpu_future = self._gpu_worker.submit(
+                WorkType.BATCH_TRANSCRIBE,
+                {
+                    "audio_paths": audio_paths,
+                    "timestamps": any_timestamps,
+                    "batch_size": len(batch),
+                },
+                self._loop,
+            )
+            results = await gpu_future
+
+            if isinstance(results, list) and len(results) == len(batch):
+                for req, result in zip(batch, results):
+                    if not req.future.done():
+                        req.future.set_result({"text": str(result), "audio_path": req.audio_path})
+            else:
+                text_results = results if isinstance(results, list) else [results]
+                for i, req in enumerate(batch):
+                    if not req.future.done():
+                        text = text_results[i] if i < len(text_results) else ""
+                        req.future.set_result({"text": str(text), "audio_path": req.audio_path})
+
+        except Exception as exc:
+            log.error(f"Batch transcription failed: {exc}")
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(exc)
+
+    @property
+    def metrics(self) -> dict:
+        return {
+            **self._metrics,
+            "pending_requests": len(self._pending),
+        }
+
+
+class QueueFullError(Exception):
+    pass

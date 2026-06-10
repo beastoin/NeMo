@@ -1,0 +1,7 @@
+# Serving dependencies (NeMo + PyTorch assumed pre-installed)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pyyaml>=6.0
+numpy>=1.24.0
+# Stress test client
+aiohttp>=3.9.0
