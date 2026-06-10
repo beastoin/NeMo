@@ -61,7 +61,6 @@ class GPUWorker:
         self._queue: queue.Queue[WorkItem] = queue.Queue(maxsize=_MAX_GPU_QUEUE)
         self._thread: Optional[threading.Thread] = None
         self._batch_model = None
-        self._stream_model = None
         self._stream_pipeline = None
         self._stream_sessions: dict[str, dict] = {}
         self._ready = threading.Event()
@@ -174,12 +173,7 @@ class GPUWorker:
             log.info("Compiling batch model with torch.compile")
             self._batch_model = torch.compile(self._batch_model)
 
-        log.info(f"Loading stream model: {self._stream_cfg['name']}")
-        self._stream_model = nemo_asr.models.ASRModel.from_pretrained(
-            self._stream_cfg["name"], map_location=device
-        )
-        self._stream_model.eval()
-
+        # Stream model is loaded by the pipeline builder — no manual load needed
         self._build_stream_pipeline()
         log.info("Models loaded and ready")
 
