@@ -67,6 +67,7 @@ class BatchEngine:
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shutting_down = False
         self._metrics = {
             "total_requests": 0,
             "total_batches": 0,
@@ -79,8 +80,8 @@ class BatchEngine:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:
+        self._shutting_down = True
         if self._flush_task:
-            self._flush_task.cancel()
             try:
                 await self._flush_task
             except asyncio.CancelledError:
@@ -119,7 +120,7 @@ class BatchEngine:
 
     async def _flush_loop(self) -> None:
         """Periodically flush partial batches."""
-        while True:
+        while not self._shutting_down:
             await asyncio.sleep(self._max_wait_seconds)
             if self._pending:
                 await self._flush_batch()
@@ -153,11 +154,13 @@ class BatchEngine:
         else:
             output["text"] = str(result)
 
-        if timestamps and hasattr(result, 'timestep'):
-            ts = result.timestep
-            if hasattr(ts, 'word'):
-                output["timestamps"] = [
-                    {"word": w.word, "start": w.start, "end": w.end} for w in ts.word if hasattr(w, 'word')
+        if timestamps and hasattr(result, 'timestamp') and isinstance(result.timestamp, dict):
+            ts = dict(result.timestamp)
+            ts.pop('timestep', None)
+            for key, entries in ts.items():
+                output[key] = [
+                    {k: int(v) if isinstance(v, (int, float)) else str(v) for k, v in entry.items()}
+                    for entry in entries
                 ]
         return output
 

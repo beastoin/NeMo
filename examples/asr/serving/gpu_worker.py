@@ -237,6 +237,7 @@ class GPUWorker:
             audio_paths,
             batch_size=batch_size,
             timestamps=timestamps,
+            return_hypotheses=timestamps,
         )
         return results
 
@@ -284,16 +285,17 @@ class GPUWorker:
         outputs = self._stream_pipeline.transcribe_step([frame])
         output = outputs[0] if outputs else None
 
-        text = ""
-        is_final = False
+        partial = ""
+        final = ""
         if output is not None:
-            text = getattr(output, 'partial_transcript', '') or ''
-            is_final = getattr(output, 'is_end_of_utterance', False)
+            partial = getattr(output, 'partial_transcript', '') or ''
+            final = getattr(output, 'final_transcript', '') or ''
 
         return {
             "stream_id": stream_id,
-            "text": text,
-            "is_final": is_final,
+            "partial_transcript": partial,
+            "final_transcript": final,
+            "is_final": bool(final),
         }
 
     def _stream_close(self, payload: dict) -> dict:

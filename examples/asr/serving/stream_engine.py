@@ -158,9 +158,12 @@ class StreamEngine:
                 {"stream_id": stream_id},
                 self._loop,
             )
-        finally:
+        except Exception as exc:
+            log.error(f"GPU close failed for stream {stream_id}, GPU-side state may leak: {exc}")
             self._sessions.pop(stream_id, None)
+            return {"stream_id": stream_id, "status": "close_failed", "error": str(exc)}
 
+        self._sessions.pop(stream_id, None)
         self._metrics["total_streams_closed"] += 1
         log.info(
             f"Closed stream {stream_id} "
