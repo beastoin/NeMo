@@ -140,11 +140,9 @@ class GPUWorker:
 
             try:
                 result = self._dispatch(item)
-                if not item.future.cancelled():
-                    item.loop.call_soon_threadsafe(item.future.set_result, result)
+                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
             except Exception as exc:
-                if not item.future.cancelled():
-                    item.loop.call_soon_threadsafe(item.future.set_exception, exc)
+                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
 
         for q in (self._stream_queue, self._batch_queue):
             while not q.empty():
@@ -158,6 +156,16 @@ class GPUWorker:
                     break
 
         log.info("GPU worker thread stopped")
+
+    @staticmethod
+    def _safe_set_result(future: asyncio.Future, result: Any) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    @staticmethod
+    def _safe_set_exception(future: asyncio.Future, exc: Exception) -> None:
+        if not future.done():
+            future.set_exception(exc)
 
     @torch.inference_mode()
     def _dispatch(self, item: WorkItem) -> Any:
