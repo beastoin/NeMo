@@ -184,7 +184,7 @@ class GPUWorker:
         log.info("Models loaded and ready")
 
     def _build_stream_pipeline(self) -> None:
-        """Build the streaming pipeline using NeMo's full config schema."""
+        """Build the streaming pipeline using NeMo's cache_aware_rnnt config."""
         from omegaconf import OmegaConf
 
         from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder
@@ -194,16 +194,15 @@ class GPUWorker:
         device_name = device_parts[0]
         device_id = int(device_parts[1]) if len(device_parts) > 1 else 0
 
-        # Load the reference config from NeMo's streaming inference example
+        # Load the cache_aware_rnnt reference config
         ref_config_path = os.path.join(
-            os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "config.yaml"
+            os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "cache_aware_rnnt.yaml"
         )
-        if os.path.exists(ref_config_path):
-            base_cfg = OmegaConf.load(ref_config_path)
-        else:
-            base_cfg = OmegaConf.create({})
+        if not os.path.exists(ref_config_path):
+            log.warning(f"Streaming config not found at {ref_config_path}, streaming will be unavailable")
+            return
 
-        # Override with our serving settings
+        base_cfg = OmegaConf.load(ref_config_path)
         overrides = OmegaConf.create({
             "asr": {
                 "model_name": self._stream_cfg["name"],
@@ -212,17 +211,18 @@ class GPUWorker:
                 "compute_dtype": "float16",
                 "use_amp": self._stream_cfg.get("amp", True),
             },
-            "pipeline_type": "cache_aware",
-            "asr_decoding_type": "rnnt",
-            "log_level": 30,
-            "matmul_precision": "high",
             "enable_itn": False,
             "enable_nmt": False,
         })
-
         cfg = OmegaConf.merge(base_cfg, overrides)
+
         self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)
-        log.info("Streaming pipeline built")
+        # Initialize the session once — per-stream state is managed via
+        # init_state() (called by transcribe_step when is_first=True) and
+        # delete_state(). Do NOT call open_session() per stream — it resets
+        # ALL stream state.
+        self._stream_pipeline.open_session()
+        log.info("Streaming pipeline built and session opened")
 
     def _batch_transcribe(self, payload: dict) -> list:
         audio_paths = payload["audio_paths"]
@@ -237,10 +237,14 @@ class GPUWorker:
         return results
 
     def _stream_open(self, payload: dict) -> dict:
+        if self._stream_pipeline is None:
+            raise RuntimeError("Streaming pipeline not available")
+
         stream_id = payload["stream_id"]
         stream_int_id = hash(stream_id) & 0x7FFFFFFF
 
-        self._stream_pipeline.open_session()
+        # Per-stream state is initialized by transcribe_step when is_first=True.
+        # Do NOT call open_session() here — it resets ALL stream state.
         self._stream_sessions[stream_id] = {
             "int_id": stream_int_id,
             "chunk_index": 0,
