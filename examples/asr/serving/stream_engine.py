@@ -90,12 +90,10 @@ class StreamEngine:
             except Exception as exc:
                 log.warning(f"Error closing stream {sid} during shutdown: {exc}")
 
-    async def open_stream(self, latency_mode: Optional[str] = None) -> dict:
+    async def open_stream(self) -> dict:
         """Open a new streaming session. Returns stream_id."""
         stream_id = str(uuid.uuid4())
 
-        # Reserve the slot before awaiting GPU to prevent concurrent opens
-        # from exceeding the limit
         if len(self._sessions) >= self._max_concurrent:
             raise TooManyStreamsError(
                 f"Active streams {len(self._sessions)} at limit {self._max_concurrent}"
@@ -105,7 +103,7 @@ class StreamEngine:
         try:
             result = await self._gpu_worker.submit(
                 WorkType.STREAM_OPEN,
-                {"stream_id": stream_id, "latency_mode": latency_mode},
+                {"stream_id": stream_id},
                 self._loop,
             )
         except BaseException:

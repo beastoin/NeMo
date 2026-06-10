@@ -251,10 +251,7 @@ async def transcribe_batch(
 
 
 @app.websocket("/v1/stream")
-async def stream_ws(
-    websocket: WebSocket,
-    latency_mode: Optional[str] = Query(None),
-):
+async def stream_ws(websocket: WebSocket):
     """
     WebSocket streaming ASR endpoint.
 
@@ -269,7 +266,7 @@ async def stream_ws(
     await websocket.accept()
 
     try:
-        session = await stream_engine.open_stream(latency_mode=latency_mode)
+        session = await stream_engine.open_stream()
         stream_id = session["stream_id"]
         await websocket.send_json(session)
     except TooManyStreamsError:

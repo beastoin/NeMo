@@ -197,6 +197,13 @@ class GPUWorker:
         self._build_stream_pipeline()
         log.info("Models loaded and ready")
 
+    _LATENCY_MODE_TO_CONTEXT = {
+        "80ms": [70, 0],
+        "160ms": [70, 1],
+        "480ms": [70, 6],
+        "1040ms": [70, 13],
+    }
+
     def _build_stream_pipeline(self) -> None:
         """Build the streaming pipeline using NeMo's cache_aware_rnnt config."""
         from omegaconf import OmegaConf
@@ -208,7 +215,6 @@ class GPUWorker:
         device_name = device_parts[0]
         device_id = int(device_parts[1]) if len(device_parts) > 1 else 0
 
-        # Load the cache_aware_rnnt reference config
         ref_config_path = os.path.join(
             os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "cache_aware_rnnt.yaml"
         )
@@ -228,6 +234,13 @@ class GPUWorker:
             "enable_itn": False,
             "enable_nmt": False,
         })
+
+        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
+        context = self._LATENCY_MODE_TO_CONTEXT.get(latency_mode)
+        if context is not None:
+            overrides["streaming"] = {"att_context_size": context}
+            log.info(f"Streaming latency mode: {latency_mode} (att_context_size={context})")
+
         cfg = OmegaConf.merge(base_cfg, overrides)
 
         self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)

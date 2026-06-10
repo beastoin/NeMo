@@ -1,5 +1,5 @@
 # Build from repo root: docker build -f examples/asr/serving/Dockerfile .
-FROM nvcr.io/nvidia/nemo:26.02
+FROM nvcr.io/nvidia/nemo:26.06
 
 WORKDIR /app/serving
 
