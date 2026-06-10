@@ -185,15 +185,10 @@ async def transcribe(
         raise HTTPException(status_code=413, detail=str(exc))
 
     try:
-        result = await batch_engine.submit(tmp_path, timestamps=timestamps)
+        result = await batch_engine.submit(tmp_path, timestamps=timestamps, owns_file=True)
         return JSONResponse(content=result)
     except QueueFullError:
         raise HTTPException(status_code=503, detail="Server overloaded — try again later")
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 _MAX_BATCH_FILES = 64
@@ -211,45 +206,35 @@ async def transcribe_batch(
     max_bytes = _max_upload_bytes()
     loop = asyncio.get_running_loop()
     tmp_paths = []
-    try:
-        for f in files:
-            suffix = Path(f.filename).suffix if f.filename else ".wav"
-            try:
-                path = await loop.run_in_executor(
-                    None, functools.partial(_save_upload_sync, f.file, suffix, max_bytes)
-                )
-                tmp_paths.append(path)
-            except ValueError:
-                tmp_paths.append(None)
+    for f in files:
+        suffix = Path(f.filename).suffix if f.filename else ".wav"
+        try:
+            path = await loop.run_in_executor(
+                None, functools.partial(_save_upload_sync, f.file, suffix, max_bytes)
+            )
+            tmp_paths.append(path)
+        except ValueError:
+            tmp_paths.append(None)
 
-        tasks = []
-        for i, p in enumerate(tmp_paths):
-            if p is None:
-                fut = loop.create_future()
-                fut.set_exception(ValueError(f"File {files[i].filename} exceeds size limit"))
-                tasks.append(fut)
-            else:
-                tasks.append(batch_engine.submit(p, timestamps=timestamps))
+    tasks = []
+    for i, p in enumerate(tmp_paths):
+        if p is None:
+            fut = loop.create_future()
+            fut.set_exception(ValueError(f"File {files[i].filename} exceeds size limit"))
+            tasks.append(fut)
+        else:
+            tasks.append(batch_engine.submit(p, timestamps=timestamps, owns_file=True))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        output = []
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                output.append({"error": str(r), "file": files[i].filename})
-            else:
-                output.append(r)
+    output = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            output.append({"error": str(r), "file": files[i].filename})
+        else:
+            output.append(r)
 
-        return JSONResponse(content={"results": output})
-    except QueueFullError:
-        raise HTTPException(status_code=503, detail="Server overloaded")
-    finally:
-        for p in tmp_paths:
-            if p is not None:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+    return JSONResponse(content={"results": output})
 
 
 # --- Streaming Transcription (Nemotron) ---

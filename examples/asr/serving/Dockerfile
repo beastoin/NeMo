@@ -1,11 +1,18 @@
+# Build from repo root: docker build -f examples/asr/serving/Dockerfile .
 FROM nvcr.io/nvidia/nemo:26.02
 
-WORKDIR /app
+WORKDIR /app/serving
 
-COPY requirements-serving.txt .
+# Install serving dependencies
+COPY examples/asr/serving/requirements-serving.txt .
 RUN pip install --no-cache-dir -r requirements-serving.txt
 
-COPY . .
+# Copy serving code
+COPY examples/asr/serving/ .
+
+# Copy configs (serving + streaming reference config)
+COPY examples/asr/serving/conf/ conf/
+COPY examples/asr/conf/asr_streaming_inference/ ../conf/asr_streaming_inference/
 
 EXPOSE 8000
 

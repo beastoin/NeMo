@@ -58,7 +58,8 @@ class GPUWorker:
     """Runs inference on a dedicated thread. Async callers submit WorkItems."""
 
     def __init__(self):
-        self._queue: queue.Queue[WorkItem] = queue.Queue(maxsize=_MAX_GPU_QUEUE)
+        self._batch_queue: queue.Queue[WorkItem] = queue.Queue(maxsize=_MAX_GPU_QUEUE)
+        self._stream_queue: queue.Queue[WorkItem] = queue.Queue(maxsize=_MAX_GPU_QUEUE)
         self._thread: Optional[threading.Thread] = None
         self._batch_model = None
         self._stream_pipeline = None
@@ -80,8 +81,9 @@ class GPUWorker:
         self._thread.start()
 
     def wait_ready(self, timeout: float = 600) -> None:
-        """Block until models are loaded. Raises if loading failed."""
-        self._ready.wait(timeout=timeout)
+        """Block until models are loaded. Raises if loading failed or timed out."""
+        if not self._ready.wait(timeout=timeout):
+            raise TimeoutError(f"GPU models did not load within {timeout}s")
         if self._load_error is not None:
             raise self._load_error
 
@@ -91,7 +93,7 @@ class GPUWorker:
         dummy_loop = asyncio.new_event_loop()
         fut = dummy_loop.create_future()
         try:
-            self._queue.put(WorkItem(WorkType.SHUTDOWN, None, fut, dummy_loop), timeout=5)
+            self._stream_queue.put(WorkItem(WorkType.SHUTDOWN, None, fut, dummy_loop), timeout=5)
         except queue.Full:
             pass
         self._running = False
@@ -104,8 +106,9 @@ class GPUWorker:
             fut.set_exception(RuntimeError("GPU worker not ready"))
             return fut
         fut = loop.create_future()
+        q = self._stream_queue if work_type != WorkType.BATCH_TRANSCRIBE else self._batch_queue
         try:
-            self._queue.put_nowait(WorkItem(work_type, payload, fut, loop))
+            q.put_nowait(WorkItem(work_type, payload, fut, loop))
         except queue.Full:
             fut.set_exception(RuntimeError("GPU queue full"))
         return fut
@@ -122,10 +125,15 @@ class GPUWorker:
             return
 
         while self._running:
+            item = None
+            # Streaming gets priority — drain stream queue before batch
             try:
-                item = self._queue.get(timeout=0.05)
+                item = self._stream_queue.get_nowait()
             except queue.Empty:
-                continue
+                try:
+                    item = self._batch_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
 
             if item.work_type == WorkType.SHUTDOWN:
                 break
@@ -136,15 +144,16 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(item.future.set_exception, exc)
 
-        while not self._queue.empty():
-            try:
-                item = self._queue.get_nowait()
-                if item.work_type != WorkType.SHUTDOWN:
-                    item.loop.call_soon_threadsafe(
-                        item.future.set_exception, RuntimeError("GPU worker shutting down")
-                    )
-            except queue.Empty:
-                break
+        for q in (self._stream_queue, self._batch_queue):
+            while not q.empty():
+                try:
+                    item = q.get_nowait()
+                    if item.work_type != WorkType.SHUTDOWN:
+                        item.loop.call_soon_threadsafe(
+                            item.future.set_exception, RuntimeError("GPU worker shutting down")
+                        )
+                except queue.Empty:
+                    break
 
         log.info("GPU worker thread stopped")
 

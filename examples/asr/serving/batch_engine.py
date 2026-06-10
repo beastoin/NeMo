@@ -30,10 +30,9 @@ Architecture:
 
 import asyncio
 import logging
-import tempfile
+import os
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Optional
 
 from gpu_worker import GPUWorker, WorkType
@@ -46,6 +45,7 @@ class PendingRequest:
     audio_path: str
     timestamps: bool
     future: asyncio.Future
+    owns_file: bool = False
     submitted_at: float = field(default_factory=time.monotonic)
 
 
@@ -88,11 +88,17 @@ class BatchEngine:
         while self._pending:
             await self._flush_batch()
 
-    async def submit(self, audio_path: str, timestamps: bool = False) -> dict:
-        """Submit a file for transcription. Returns when the batch completes."""
+    async def submit(self, audio_path: str, timestamps: bool = False, owns_file: bool = False) -> dict:
+        """Submit a file for transcription. Returns when the batch completes.
+
+        If owns_file=True, the engine takes ownership and deletes the file
+        after GPU processing completes (even on error or cancellation).
+        """
         async with self._lock:
             if len(self._pending) >= self._max_queue_depth:
                 self._metrics["rejected_requests"] += 1
+                if owns_file:
+                    self._unlink_safe(audio_path)
                 raise QueueFullError(
                     f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}"
                 )
@@ -102,6 +108,7 @@ class BatchEngine:
                 audio_path=audio_path,
                 timestamps=timestamps,
                 future=future,
+                owns_file=owns_file,
             ))
             self._metrics["total_requests"] += 1
 
@@ -154,6 +161,18 @@ class BatchEngine:
                 ]
         return output
 
+    @staticmethod
+    def _unlink_safe(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _cleanup_owned_files(self, batch: list[PendingRequest]) -> None:
+        for req in batch:
+            if req.owns_file:
+                self._unlink_safe(req.audio_path)
+
     async def _run_sub_batch(self, batch: list[PendingRequest], timestamps: bool) -> None:
         audio_paths = [r.audio_path for r in batch]
         try:
@@ -193,6 +212,8 @@ class BatchEngine:
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(exc)
+        finally:
+            self._cleanup_owned_files(batch)
 
     @property
     def metrics(self) -> dict:
