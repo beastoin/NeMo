@@ -34,7 +34,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from gpu_worker import GPUWorker, WorkType
 
@@ -137,6 +137,23 @@ class BatchEngine:
                 continue
             await self._run_sub_batch(sub_batch, timestamps)
 
+    @staticmethod
+    def _serialize_result(result: Any, audio_path: str, timestamps: bool) -> dict:
+        """Convert a NeMo transcription result to a JSON-serializable dict."""
+        output = {"audio_path": audio_path}
+        if hasattr(result, 'text'):
+            output["text"] = result.text
+        else:
+            output["text"] = str(result)
+
+        if timestamps and hasattr(result, 'timestep'):
+            ts = result.timestep
+            if hasattr(ts, 'word'):
+                output["timestamps"] = [
+                    {"word": w.word, "start": w.start, "end": w.end} for w in ts.word if hasattr(w, 'word')
+                ]
+        return output
+
     async def _run_sub_batch(self, batch: list[PendingRequest], timestamps: bool) -> None:
         audio_paths = [r.audio_path for r in batch]
         try:
@@ -154,14 +171,23 @@ class BatchEngine:
             if isinstance(results, list) and len(results) == len(batch):
                 for req, result in zip(batch, results):
                     if not req.future.done():
-                        req.future.set_result({"text": str(result), "audio_path": req.audio_path})
+                        req.future.set_result(self._serialize_result(result, req.audio_path, timestamps))
             else:
                 text_results = results if isinstance(results, list) else [results]
                 for i, req in enumerate(batch):
                     if not req.future.done():
-                        text = text_results[i] if i < len(text_results) else ""
-                        req.future.set_result({"text": str(text), "audio_path": req.audio_path})
+                        result = text_results[i] if i < len(text_results) else ""
+                        req.future.set_result(self._serialize_result(result, req.audio_path, timestamps))
 
+        except RuntimeError as exc:
+            if "GPU queue full" in str(exc):
+                err = QueueFullError(str(exc))
+            else:
+                err = exc
+            log.error(f"Batch transcription failed: {exc}")
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(err)
         except Exception as exc:
             log.error(f"Batch transcription failed: {exc}")
             for req in batch:

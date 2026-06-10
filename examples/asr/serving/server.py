@@ -32,10 +32,10 @@ Usage:
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -51,7 +51,7 @@ from fastapi.responses import JSONResponse
 sys.path.insert(0, os.path.dirname(__file__))
 from batch_engine import BatchEngine, QueueFullError
 from gpu_worker import GPUWorker
-from stream_engine import StreamEngine, StreamExpiredError, TooManyStreamsError
+from stream_engine import ChunkTooLargeError, StreamEngine, StreamExpiredError, TooManyStreamsError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +102,7 @@ async def lifespan(app: FastAPI):
         chunk_duration_ms=stream_cfg.get("chunk_duration_ms", 160),
         sample_rate=stream_cfg.get("sample_rate", 16000),
         max_stream_duration=stream_cfg.get("max_stream_duration", 1800),
+        max_chunk_bytes=stream_cfg.get("max_chunk_bytes", 512 * 1024),
     )
     await stream_engine.start()
 
@@ -146,23 +147,42 @@ async def metrics():
 # --- Batch Transcription (Parakeet TDT) ---
 
 
+def _max_upload_bytes() -> int:
+    return config.get("batcher", {}).get("max_upload_bytes", 100 * 1024 * 1024)
+
+
+def _save_upload_sync(src_file, suffix: str, max_bytes: int) -> str:
+    """Save an upload to a temp file with size enforcement. Runs in threadpool."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        total = 0
+        while True:
+            chunk = src_file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                tmp.close()
+                os.unlink(tmp_path)
+                raise ValueError(f"File exceeds {max_bytes} byte limit")
+            tmp.write(chunk)
+    return tmp_path
+
+
 @app.post("/v1/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
     timestamps: bool = Query(False, description="Include word-level timestamps"),
 ):
     """Transcribe an audio file using Parakeet TDT with dynamic batching."""
-    max_size = config.get("batcher", {}).get("max_audio_duration", 600) * 16000 * 2  # approx bytes at 16kHz PCM16
-
+    max_bytes = _max_upload_bytes()
     suffix = Path(file.filename).suffix if file.filename else ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
-        shutil.copyfileobj(file.file, tmp)
 
-    file_size = os.path.getsize(tmp_path)
-    if file_size > max_size:
-        os.unlink(tmp_path)
-        raise HTTPException(status_code=413, detail=f"Audio too long (max {max_size // 32000}s at 16kHz)")
+    loop = asyncio.get_running_loop()
+    try:
+        tmp_path = await loop.run_in_executor(None, functools.partial(_save_upload_sync, file.file, suffix, max_bytes))
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
 
     try:
         result = await batch_engine.submit(tmp_path, timestamps=timestamps)
@@ -176,21 +196,41 @@ async def transcribe(
             pass
 
 
+_MAX_BATCH_FILES = 64
+
+
 @app.post("/v1/transcribe/batch")
 async def transcribe_batch(
     files: list[UploadFile] = File(...),
     timestamps: bool = Query(False),
 ):
     """Transcribe multiple files. All are batched together for GPU efficiency."""
+    if len(files) > _MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {_MAX_BATCH_FILES})")
+
+    max_bytes = _max_upload_bytes()
+    loop = asyncio.get_running_loop()
     tmp_paths = []
     try:
         for f in files:
             suffix = Path(f.filename).suffix if f.filename else ".wav"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                shutil.copyfileobj(f.file, tmp)
-                tmp_paths.append(tmp.name)
+            try:
+                path = await loop.run_in_executor(
+                    None, functools.partial(_save_upload_sync, f.file, suffix, max_bytes)
+                )
+                tmp_paths.append(path)
+            except ValueError:
+                tmp_paths.append(None)
 
-        tasks = [batch_engine.submit(p, timestamps=timestamps) for p in tmp_paths]
+        tasks = []
+        for i, p in enumerate(tmp_paths):
+            if p is None:
+                fut = loop.create_future()
+                fut.set_exception(ValueError(f"File {files[i].filename} exceeds size limit"))
+                tasks.append(fut)
+            else:
+                tasks.append(batch_engine.submit(p, timestamps=timestamps))
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         output = []
@@ -205,10 +245,11 @@ async def transcribe_batch(
         raise HTTPException(status_code=503, detail="Server overloaded")
     finally:
         for p in tmp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            if p is not None:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 # --- Streaming Transcription (Nemotron) ---
@@ -259,7 +300,7 @@ async def stream_ws(
 
     except WebSocketDisconnect:
         pass
-    except StreamExpiredError as exc:
+    except (StreamExpiredError, ChunkTooLargeError) as exc:
         await websocket.send_json({"error": str(exc)})
     except Exception as exc:
         log.error(f"Stream {stream_id} error: {exc}")

@@ -63,6 +63,7 @@ class GPUWorker:
         self._batch_model = None
         self._stream_pipeline = None
         self._stream_sessions: dict[str, dict] = {}
+        self._next_stream_int_id = 1
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
@@ -235,10 +236,9 @@ class GPUWorker:
             raise RuntimeError("Streaming pipeline not available")
 
         stream_id = payload["stream_id"]
-        stream_int_id = hash(stream_id) & 0x7FFFFFFF
+        stream_int_id = self._next_stream_int_id
+        self._next_stream_int_id += 1
 
-        # Per-stream state is initialized by transcribe_step when is_first=True.
-        # Do NOT call open_session() here — it resets ALL stream state.
         self._stream_sessions[stream_id] = {
             "int_id": stream_int_id,
             "chunk_index": 0,

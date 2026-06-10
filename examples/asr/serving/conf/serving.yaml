@@ -24,10 +24,11 @@ batcher:
   max_batch_size: 32
   max_wait_seconds: 0.1  # flush partial batch after this delay
   max_queue_depth: 256  # backpressure limit — 503 if exceeded
-  max_audio_duration: 600  # reject files longer than 10 minutes
+  max_upload_bytes: 104857600  # 100MB per file — hard limit on upload size
 
 stream:
   max_concurrent_streams: 128
   chunk_duration_ms: 160  # audio chunk size from client
   sample_rate: 16000
   max_stream_duration: 1800  # auto-close after 30 minutes
+  max_chunk_bytes: 524288  # 512KB max per WebSocket frame

@@ -63,12 +63,14 @@ class StreamEngine:
         chunk_duration_ms: int = 160,
         sample_rate: int = 16000,
         max_stream_duration: int = 1800,
+        max_chunk_bytes: int = 512 * 1024,
     ):
         self._gpu_worker = gpu_worker
         self._max_concurrent = max_concurrent_streams
         self._chunk_duration_ms = chunk_duration_ms
         self._sample_rate = sample_rate
         self._max_stream_duration = max_stream_duration
+        self._max_chunk_bytes = max_chunk_bytes
         self._sessions: dict[str, StreamSession] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._metrics = {
@@ -116,6 +118,9 @@ class StreamEngine:
 
     async def process_chunk(self, stream_id: str, audio_bytes: bytes) -> dict:
         """Process an audio chunk for an active stream."""
+        if len(audio_bytes) > self._max_chunk_bytes:
+            raise ChunkTooLargeError(f"Chunk {len(audio_bytes)} bytes exceeds limit {self._max_chunk_bytes}")
+
         session = self._sessions.get(stream_id)
         if session is None:
             raise ValueError(f"Unknown stream: {stream_id}")
@@ -143,15 +148,18 @@ class StreamEngine:
 
     async def close_stream(self, stream_id: str) -> dict:
         """Close a streaming session and return final transcript."""
-        session = self._sessions.pop(stream_id, None)
+        session = self._sessions.get(stream_id)
         if session is None:
             return {"stream_id": stream_id, "status": "not_found"}
 
-        result = await self._gpu_worker.submit(
-            WorkType.STREAM_CLOSE,
-            {"stream_id": stream_id},
-            self._loop,
-        )
+        try:
+            result = await self._gpu_worker.submit(
+                WorkType.STREAM_CLOSE,
+                {"stream_id": stream_id},
+                self._loop,
+            )
+        finally:
+            self._sessions.pop(stream_id, None)
 
         self._metrics["total_streams_closed"] += 1
         log.info(
@@ -173,4 +181,8 @@ class TooManyStreamsError(Exception):
 
 
 class StreamExpiredError(Exception):
+    pass
+
+
+class ChunkTooLargeError(Exception):
     pass
