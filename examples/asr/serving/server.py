@@ -184,19 +184,11 @@ async def transcribe(
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc))
 
-    submitted = False
     try:
         result = await batch_engine.submit(tmp_path, timestamps=timestamps, owns_file=True)
-        submitted = True
         return JSONResponse(content=result)
     except QueueFullError:
         raise HTTPException(status_code=503, detail="Server overloaded — try again later")
-    finally:
-        if not submitted:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 _MAX_BATCH_FILES = 64

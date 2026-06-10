@@ -95,26 +95,31 @@ class BatchEngine:
         If owns_file=True, the engine takes ownership and deletes the file
         after GPU processing completes (even on error or cancellation).
         """
-        async with self._lock:
-            if len(self._pending) >= self._max_queue_depth:
-                self._metrics["rejected_requests"] += 1
-                if owns_file:
-                    self._unlink_safe(audio_path)
-                raise QueueFullError(
-                    f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}"
-                )
+        enqueued = False
+        try:
+            async with self._lock:
+                if len(self._pending) >= self._max_queue_depth:
+                    self._metrics["rejected_requests"] += 1
+                    raise QueueFullError(
+                        f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}"
+                    )
 
-            future = self._loop.create_future()
-            self._pending.append(PendingRequest(
-                audio_path=audio_path,
-                timestamps=timestamps,
-                future=future,
-                owns_file=owns_file,
-            ))
-            self._metrics["total_requests"] += 1
+                future = self._loop.create_future()
+                self._pending.append(PendingRequest(
+                    audio_path=audio_path,
+                    timestamps=timestamps,
+                    future=future,
+                    owns_file=owns_file,
+                ))
+                enqueued = True
+                self._metrics["total_requests"] += 1
 
-            if len(self._pending) >= self._max_batch_size:
-                asyncio.create_task(self._flush_batch())
+                if len(self._pending) >= self._max_batch_size:
+                    asyncio.create_task(self._flush_batch())
+        except BaseException:
+            if owns_file and not enqueued:
+                self._unlink_safe(audio_path)
+            raise
 
         return await future
 
@@ -158,10 +163,18 @@ class BatchEngine:
             ts = dict(result.timestamp)
             ts.pop('timestep', None)
             for key, entries in ts.items():
-                output[key] = [
-                    {k: int(v) if isinstance(v, (int, float)) else str(v) for k, v in entry.items()}
-                    for entry in entries
-                ]
+                serialized = []
+                for entry in entries:
+                    item = {}
+                    for k, v in entry.items():
+                        if isinstance(v, float):
+                            item[k] = round(v, 4)
+                        elif isinstance(v, int):
+                            item[k] = v
+                        else:
+                            item[k] = str(v)
+                    serialized.append(item)
+                output[key] = serialized
         return output
 
     @staticmethod
