@@ -344,6 +344,7 @@ class TranscriptionMixin(ABC):
 
         return results
 
+    @torch.inference_mode()
     def transcribe_generator(self, audio, override_config: Optional[TranscribeConfig]):
         """
         A generator version of `transcribe` function.
@@ -770,35 +771,6 @@ class ASRTranscriptionMixin(TranscriptionMixin):
             trcfg: The transcription config dataclass. Subclasses can change this to a different dataclass if needed.
         """
         super()._transcribe_on_begin(audio, trcfg)
-
-        # Freeze the encoder and decoder modules
-        if hasattr(self, 'encoder'):
-            self.encoder.freeze()
-
-        if hasattr(self, 'decoder'):
-            self.decoder.freeze()
-
-        if hasattr(self, 'joint'):
-            self.joint.freeze()
-
-    def _transcribe_on_end(self, trcfg: TranscribeConfig):
-        """
-        Internal function to teardown the model after transcription. Perform all teardown and post-checks here.
-
-        Args:
-            trcfg: The transcription config dataclass. Subclasses can change this to a different dataclass if needed.
-        """
-        super()._transcribe_on_end(trcfg)
-
-        # Unfreeze the encoder and decoder modules
-        if hasattr(self, 'encoder'):
-            self.encoder.unfreeze(partial=True)
-
-        if hasattr(self, 'decoder'):
-            self.decoder.unfreeze(partial=True)
-
-        if hasattr(self, 'joint'):
-            self.joint.unfreeze(partial=True)
 
     @classmethod
     def get_transcribe_config(cls) -> TranscribeConfig:

@@ -922,9 +922,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         """
         super()._transcribe_on_begin(audio, trcfg)
 
-        # Switch model to evaluation mode
-        self.transf_decoder.freeze()
-
         if isinstance(audio, list):
             logging.debug(f"Found 'audio' to be a list of {len(audio)} items.")
             logging.debug("Assuming each item in 'audio' is a path to audio file.")
@@ -1178,8 +1175,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             trcfg: The transcription config dataclass. Subclasses can change this to a different dataclass if needed.
         """
         super()._transcribe_on_end(trcfg)
-
-        self.transf_decoder.unfreeze(partial=True)
 
     def _may_be_make_dict_and_fix_paths(self, json_items, manifest_path, trcfg: MultiTaskTranscriptionConfig):
         """
