@@ -108,7 +108,7 @@ class StreamEngine:
                 {"stream_id": stream_id, "latency_mode": latency_mode},
                 self._loop,
             )
-        except Exception:
+        except BaseException:
             self._sessions.pop(stream_id, None)
             raise
 
@@ -148,7 +148,7 @@ class StreamEngine:
 
     async def close_stream(self, stream_id: str) -> dict:
         """Close a streaming session and return final transcript."""
-        session = self._sessions.get(stream_id)
+        session = self._sessions.pop(stream_id, None)
         if session is None:
             return {"stream_id": stream_id, "status": "not_found"}
 
@@ -160,10 +160,8 @@ class StreamEngine:
             )
         except Exception as exc:
             log.error(f"GPU close failed for stream {stream_id}, GPU-side state may leak: {exc}")
-            self._sessions.pop(stream_id, None)
             return {"stream_id": stream_id, "status": "close_failed", "error": str(exc)}
 
-        self._sessions.pop(stream_id, None)
         self._metrics["total_streams_closed"] += 1
         log.info(
             f"Closed stream {stream_id} "

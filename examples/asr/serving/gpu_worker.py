@@ -140,9 +140,11 @@ class GPUWorker:
 
             try:
                 result = self._dispatch(item)
-                item.loop.call_soon_threadsafe(item.future.set_result, result)
+                if not item.future.cancelled():
+                    item.loop.call_soon_threadsafe(item.future.set_result, result)
             except Exception as exc:
-                item.loop.call_soon_threadsafe(item.future.set_exception, exc)
+                if not item.future.cancelled():
+                    item.loop.call_soon_threadsafe(item.future.set_exception, exc)
 
         for q in (self._stream_queue, self._batch_queue):
             while not q.empty():
