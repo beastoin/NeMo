@@ -85,7 +85,7 @@ class BatchEngine:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
-        if self._pending:
+        while self._pending:
             await self._flush_batch()
 
     async def submit(self, audio_path: str, timestamps: bool = False) -> dict:

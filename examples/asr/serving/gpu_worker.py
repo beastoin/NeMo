@@ -22,6 +22,7 @@ thread via a work queue.
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -61,6 +62,7 @@ class GPUWorker:
         self._thread: Optional[threading.Thread] = None
         self._batch_model = None
         self._stream_model = None
+        self._stream_pipeline = None
         self._stream_sessions: dict[str, dict] = {}
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
@@ -134,7 +136,6 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(item.future.set_exception, exc)
 
-        # Drain remaining items and reject them
         while not self._queue.empty():
             try:
                 item = self._queue.get_nowait()
@@ -183,30 +184,45 @@ class GPUWorker:
         log.info("Models loaded and ready")
 
     def _build_stream_pipeline(self) -> None:
-        """Build the streaming pipeline from the loaded stream model."""
+        """Build the streaming pipeline using NeMo's full config schema."""
         from omegaconf import OmegaConf
 
-        from nemo.collections.asr.inference.factory.cache_aware_pipeline_builder import CacheAwarePipelineBuilder
+        from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder
 
-        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
-        cfg = OmegaConf.create({
-            "model_path": None,
-            "pretrained_name": self._stream_cfg["name"],
+        device = self._stream_cfg.get("device", "cuda:0")
+        device_parts = device.split(":")
+        device_name = device_parts[0]
+        device_id = int(device_parts[1]) if len(device_parts) > 1 else 0
+
+        # Load the reference config from NeMo's streaming inference example
+        ref_config_path = os.path.join(
+            os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "config.yaml"
+        )
+        if os.path.exists(ref_config_path):
+            base_cfg = OmegaConf.load(ref_config_path)
+        else:
+            base_cfg = OmegaConf.create({})
+
+        # Override with our serving settings
+        overrides = OmegaConf.create({
+            "asr": {
+                "model_name": self._stream_cfg["name"],
+                "device": device_name,
+                "device_id": device_id,
+                "compute_dtype": "float16",
+                "use_amp": self._stream_cfg.get("amp", True),
+            },
             "pipeline_type": "cache_aware",
-            "asr_decoding_type": "RNNT",
+            "asr_decoding_type": "rnnt",
             "log_level": 30,
             "matmul_precision": "high",
-            "latency": latency_mode,
-            "asr": {
-                "model_path": None,
-                "pretrained_name": self._stream_cfg["name"],
-                "decoding": {},
-            },
-            "itn": {"enabled": False},
-            "nmt": {"enabled": False},
+            "enable_itn": False,
+            "enable_nmt": False,
         })
-        self._stream_pipeline = CacheAwarePipelineBuilder.build(cfg)
-        log.info(f"Streaming pipeline built (latency={latency_mode})")
+
+        cfg = OmegaConf.merge(base_cfg, overrides)
+        self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)
+        log.info("Streaming pipeline built")
 
     def _batch_transcribe(self, payload: dict) -> list:
         audio_paths = payload["audio_paths"]
@@ -222,9 +238,11 @@ class GPUWorker:
 
     def _stream_open(self, payload: dict) -> dict:
         stream_id = payload["stream_id"]
+        stream_int_id = hash(stream_id) & 0x7FFFFFFF
 
         self._stream_pipeline.open_session()
         self._stream_sessions[stream_id] = {
+            "int_id": stream_int_id,
             "chunk_index": 0,
             "created_at": time.monotonic(),
         }
@@ -232,6 +250,7 @@ class GPUWorker:
 
     def _stream_chunk(self, payload: dict) -> dict:
         from nemo.collections.asr.inference.streaming.framing.request import Frame
+        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
 
         stream_id = payload["stream_id"]
         audio_chunk = payload["audio_chunk"]
@@ -245,41 +264,54 @@ class GPUWorker:
         session["chunk_index"] = chunk_index + 1
 
         samples = torch.tensor(audio_chunk, dtype=torch.float32)
+        options = ASRRequestOptions(enable_itn=False, enable_nmt=False) if is_first else None
+
         frame = Frame(
             samples=samples,
-            stream_id=hash(stream_id) & 0x7FFFFFFF,
+            stream_id=session["int_id"],
             is_first=is_first,
             is_last=False,
+            options=options,
         )
 
         outputs = self._stream_pipeline.transcribe_step([frame])
         output = outputs[0] if outputs else None
 
+        text = ""
+        is_final = False
+        if output is not None:
+            text = getattr(output, 'partial_transcript', '') or ''
+            is_final = getattr(output, 'is_end_of_utterance', False)
+
         return {
             "stream_id": stream_id,
-            "text": output.partial_transcript if output else "",
-            "is_final": output.is_end_of_utterance if output and hasattr(output, 'is_end_of_utterance') else False,
+            "text": text,
+            "is_final": is_final,
         }
 
     def _stream_close(self, payload: dict) -> dict:
         from nemo.collections.asr.inference.streaming.framing.request import Frame
+        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
 
         stream_id = payload["stream_id"]
         session = self._stream_sessions.pop(stream_id, None)
 
         if session is not None:
-            # Send a final empty frame to flush the pipeline
             frame = Frame(
-                samples=torch.zeros(1),
-                stream_id=hash(stream_id) & 0x7FFFFFFF,
+                samples=torch.zeros(1, dtype=torch.float32),
+                stream_id=session["int_id"],
                 is_first=False,
                 is_last=True,
+                options=ASRRequestOptions(enable_itn=False, enable_nmt=False),
             )
             outputs = self._stream_pipeline.transcribe_step([frame])
             output = outputs[0] if outputs else None
 
-            self._stream_pipeline.close_session()
-            final_text = output.final_transcript if output and hasattr(output, 'final_transcript') else ""
+            self._stream_pipeline.delete_state(session["int_id"])
+
+            final_text = ""
+            if output is not None:
+                final_text = getattr(output, 'final_transcript', '') or ''
 
             return {
                 "stream_id": stream_id,
