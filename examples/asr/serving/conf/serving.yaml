@@ -9,7 +9,7 @@ server:
 batch_model:
   name: "nvidia/parakeet-tdt-0.6b-v3"
   device: "cuda:0"
-  compile: false  # set true for ~20% throughput boost after warmup
+  compile: true  # chaos-tested: +20-30% GPU speed after ~60s warmup
   amp: true
 
 stream_model:

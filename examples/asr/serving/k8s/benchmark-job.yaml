@@ -1,0 +1,182 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zen-asr-benchmark
+  namespace: dev-omi-backend
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: zen-asr-benchmark
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: benchmark
+          image: python:3.12-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              apt-get update -qq && apt-get install -y -qq espeak-ng > /dev/null 2>&1
+              pip install -q aiohttp numpy
+
+              cat > /tmp/bench.py << 'PYEOF'
+              import asyncio, aiohttp, io, json, struct, subprocess, os, tempfile, time
+              import numpy as np
+
+              SERVER = os.environ.get("ASR_SERVER", "http://zen-asr-server:8000")
+              CACHE = "/tmp/asr-audio"
+
+              def wav(dur, sr=16000):
+                  n = int(dur * sr)
+                  b = io.BytesIO()
+                  d = n * 2
+                  b.write(b"RIFF"); b.write(struct.pack("<I", 36+d)); b.write(b"WAVE")
+                  b.write(b"fmt "); b.write(struct.pack("<IHHIIHH", 16,1,1,sr,sr*2,2,16))
+                  b.write(b"data"); b.write(struct.pack("<I", d))
+                  b.write(np.zeros(n, dtype=np.int16).tobytes())
+                  return b.getvalue()
+
+              def tts(text, path):
+                  try:
+                      subprocess.run(["espeak-ng","-w",path,"--stdin","-s","150","-a","100"],
+                                     input=text, text=True, capture_output=True, check=True, timeout=30)
+                      return True
+                  except: return False
+
+              def prep():
+                  os.makedirs(CACHE, exist_ok=True)
+                  files = []
+                  for i, s in enumerate(["The quick brown fox jumps over the lazy dog.",
+                                          "Artificial intelligence is transforming how we interact with technology.",
+                                          "Please remember to save your work before closing the application."]):
+                      p = f"{CACHE}/tts_{i}.wav"
+                      if not os.path.exists(p): tts(s, p)
+                      if os.path.exists(p):
+                          with open(p, "rb") as f: files.append(f.read())
+                  return files
+
+              async def measure(session, server, audio, conc, n, label=""):
+                  sem = asyncio.Semaphore(conc)
+                  ok, fail, lats = 0, 0, []
+                  async def one(idx):
+                      nonlocal ok, fail
+                      d = audio[idx % len(audio)]
+                      async with sem:
+                          t0 = time.monotonic()
+                          try:
+                              form = aiohttp.FormData()
+                              form.add_field("file", d, filename=f"b_{idx}.wav", content_type="audio/wav")
+                              async with session.post(f"{server}/v1/transcribe", data=form) as r:
+                                  await r.json()
+                                  if r.status == 200: ok += 1; lats.append(time.monotonic()-t0)
+                                  else: fail += 1
+                          except: fail += 1
+                  t_wall = time.monotonic()
+                  await asyncio.gather(*[one(i) for i in range(n)])
+                  wall = time.monotonic() - t_wall
+                  lats.sort()
+                  return {"label": label, "conc": conc, "n": n, "ok": ok, "fail": fail,
+                          "wall_s": round(wall,2), "rps": round(ok/wall,2) if wall else 0,
+                          "p50": round(lats[len(lats)//2]*1000,1) if lats else 0,
+                          "p95": round(lats[int(len(lats)*0.95)]*1000,1) if lats else 0,
+                          "p99": round(lats[int(len(lats)*0.99)]*1000,1) if lats else 0}
+
+              async def main():
+                  print(f"Server: {SERVER}")
+                  async with aiohttp.ClientSession() as s:
+                      async with s.get(f"{SERVER}/health") as r:
+                          h = await r.json()
+                          print(f"Health: {h}")
+
+                      # Network baseline
+                      lats = []
+                      for _ in range(100):
+                          t0 = time.monotonic()
+                          async with s.get(f"{SERVER}/health") as r: await r.json()
+                          lats.append(time.monotonic()-t0)
+                      lats.sort()
+                      net = {"p50_ms": round(lats[50]*1000,2), "p99_ms": round(lats[99]*1000,2)}
+                      print(f"Network overhead: {net}")
+
+                  audio = prep()
+                  print(f"Audio samples: {len(audio)}")
+
+                  report = {"server": SERVER, "network": net, "tests": []}
+
+                  async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+                      # Warmup (torch.compile needs first batch)
+                      print("Warmup (torch.compile may take ~60s on first batch)...")
+                      t0 = time.monotonic()
+                      r = await measure(s, SERVER, audio, 1, 5, "warmup")
+                      warmup_time = time.monotonic() - t0
+                      print(f"Warmup done in {warmup_time:.1f}s: {r}")
+                      report["warmup_seconds"] = round(warmup_time, 1)
+
+                      # Concurrency sweep
+                      for conc in [1, 2, 4, 8, 16, 32, 64, 128]:
+                          r = await measure(s, SERVER, audio, conc, 200, f"conc={conc}")
+                          report["tests"].append(r)
+                          print(f"  conc={conc}: {r['rps']} RPS, p50={r['p50']}ms, fail={r['fail']}")
+                          await asyncio.sleep(1)
+
+                      # Sustained 60s at best concurrency
+                      print("Sustained load 60s at conc=32...")
+                      sem = asyncio.Semaphore(32)
+                      deadline = time.monotonic() + 60
+                      ok_c, fail_c, all_lats, idx = 0, 0, [], 0
+                      active = []
+                      while time.monotonic() < deadline or active:
+                          while len(active) < 64 and time.monotonic() < deadline:
+                              d = audio[idx % len(audio)]
+                              ts = time.monotonic()
+                              async def do(dd=d, tts=ts):
+                                  nonlocal ok_c, fail_c
+                                  async with sem:
+                                      try:
+                                          form = aiohttp.FormData()
+                                          form.add_field("file",dd,filename="s.wav",content_type="audio/wav")
+                                          async with s.post(f"{SERVER}/v1/transcribe",data=form) as rr:
+                                              await rr.json()
+                                              if rr.status==200: ok_c+=1; all_lats.append(time.monotonic()-tts)
+                                              else: fail_c+=1
+                                      except: fail_c+=1
+                              active.append(asyncio.create_task(do()))
+                              idx += 1
+                          if active:
+                              done, pend = await asyncio.wait(active, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                              active = list(pend)
+                              if time.monotonic() >= deadline:
+                                  for t in active: await t
+                                  active = []
+
+                      all_lats.sort()
+                      sustained = {
+                          "duration": 60, "requests": ok_c+fail_c, "ok": ok_c, "fail": fail_c,
+                          "rps": round(ok_c/60, 2),
+                          "p50": round(all_lats[len(all_lats)//2]*1000,1) if all_lats else 0,
+                          "p95": round(all_lats[int(len(all_lats)*0.95)]*1000,1) if all_lats else 0,
+                          "p99": round(all_lats[int(len(all_lats)*0.99)]*1000,1) if all_lats else 0,
+                      }
+                      report["sustained"] = sustained
+                      print(f"Sustained: {sustained['rps']} RPS, p50={sustained['p50']}ms")
+
+                  print(json.dumps(report, indent=2))
+
+              asyncio.run(main())
+              PYEOF
+
+              python3 /tmp/bench.py
+          env:
+            - name: ASR_SERVER
+              value: "http://zen-asr-server:8000"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
