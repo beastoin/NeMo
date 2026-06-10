@@ -294,13 +294,19 @@ class GPUWorker:
         }
 
     def _stream_close(self, payload: dict) -> dict:
-        from nemo.collections.asr.inference.streaming.framing.request import Frame
-        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
-
         stream_id = payload["stream_id"]
         session = self._stream_sessions.pop(stream_id, None)
 
-        if session is not None:
+        if session is None:
+            return {"stream_id": stream_id, "status": "not_found"}
+
+        final_text = ""
+
+        # Only send final frame if chunks were actually processed
+        if session["chunk_index"] > 0:
+            from nemo.collections.asr.inference.streaming.framing.request import Frame
+            from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+
             frame = Frame(
                 samples=torch.zeros(1, dtype=torch.float32),
                 stream_id=session["int_id"],
@@ -310,16 +316,13 @@ class GPUWorker:
             )
             outputs = self._stream_pipeline.transcribe_step([frame])
             output = outputs[0] if outputs else None
-
-            self._stream_pipeline.delete_state(session["int_id"])
-
-            final_text = ""
             if output is not None:
                 final_text = getattr(output, 'final_transcript', '') or ''
 
-            return {
-                "stream_id": stream_id,
-                "final_text": final_text,
-                "status": "closed",
-            }
-        return {"stream_id": stream_id, "status": "not_found"}
+            self._stream_pipeline.delete_state(session["int_id"])
+
+        return {
+            "stream_id": stream_id,
+            "final_text": final_text,
+            "status": "closed",
+        }
