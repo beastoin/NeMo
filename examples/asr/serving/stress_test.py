@@ -255,22 +255,42 @@ async def batch_stress_test(
     concurrency: int = 32,
     total_requests: int = 200,
     audio_duration: float = 5.0,
+    real_audio: bool = False,
 ) -> StressTestResult:
     """Fire concurrent batch transcription requests."""
-    result = StressTestResult(f"batch (concurrency={concurrency})")
-    audio_data = generate_test_audio(audio_duration)
+    label = f"batch-real (concurrency={concurrency})" if real_audio else f"batch (concurrency={concurrency})"
+    result = StressTestResult(label)
     semaphore = asyncio.Semaphore(concurrency)
+
+    if real_audio:
+        samples = prepare_quality_audio()
+        if not samples:
+            raise RuntimeError("No real audio available. Install espeak-ng: apt install espeak-ng")
+        audio_files = []
+        for s in samples:
+            with open(s["path"], "rb") as f:
+                suffix = Path(s["path"]).suffix or ".wav"
+                audio_files.append((f.read(), s["name"], suffix))
+        log.info(f"Loaded {len(audio_files)} real audio samples for stress test")
+    else:
+        audio_data = generate_test_audio(audio_duration)
+        audio_files = [(audio_data, "synthetic", ".wav")]
 
     async def send_one(session: aiohttp.ClientSession, idx: int):
         async with semaphore:
+            data, name, suffix = audio_files[idx % len(audio_files)]
             t0 = time.monotonic()
             try:
                 form = aiohttp.FormData()
-                form.add_field("file", audio_data, filename=f"test_{idx}.wav", content_type="audio/wav")
+                form.add_field("file", data, filename=f"{name}_{idx}{suffix}", content_type="audio/wav")
                 async with session.post(f"{server}/v1/transcribe", data=form) as resp:
                     if resp.status == 200:
-                        await resp.json()
-                        result.record_success(time.monotonic() - t0)
+                        body = await resp.json()
+                        text = body.get("text", "")
+                        if real_audio and not text.strip():
+                            result.record_failure(f"Empty transcription for {name}")
+                        else:
+                            result.record_success(time.monotonic() - t0)
                     else:
                         text = await resp.text()
                         result.record_failure(f"HTTP {resp.status}: {text[:200]}")
@@ -433,6 +453,7 @@ async def main():
     parser.add_argument("--streams", type=int, default=16)
     parser.add_argument("--chunks", type=int, default=100)
     parser.add_argument("--audio-duration", type=float, default=5.0)
+    parser.add_argument("--real-audio", action="store_true", help="Use real speech audio instead of silence")
     args = parser.parse_args()
 
     log.info(f"Stress test: mode={args.mode} server={args.server}")
@@ -447,7 +468,9 @@ async def main():
             return
 
     if args.mode == "batch":
-        result = await batch_stress_test(args.server, args.concurrency, args.requests, args.audio_duration)
+        result = await batch_stress_test(
+            args.server, args.concurrency, args.requests, args.audio_duration, args.real_audio
+        )
         print(json.dumps(result.summary(), indent=2))
 
     elif args.mode == "stream":
