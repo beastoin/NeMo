@@ -83,6 +83,8 @@ async def lifespan(app: FastAPI):
         batch_cfg=config.get("batch_model", {}),
         stream_cfg=config.get("stream_model", {}),
     )
+    log.info("Waiting for GPU models to load...")
+    gpu_worker.wait_ready(timeout=600)
 
     batcher_cfg = config.get("batcher", {})
     batch_engine = BatchEngine(
@@ -124,7 +126,12 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "uptime_seconds": round(time.monotonic() - start_time, 1)}
+    ready = gpu_worker.is_ready if gpu_worker else False
+    return {
+        "status": "ok" if ready else "loading",
+        "ready": ready,
+        "uptime_seconds": round(time.monotonic() - start_time, 1),
+    }
 
 
 @app.get("/metrics")
@@ -145,12 +152,17 @@ async def transcribe(
     timestamps: bool = Query(False, description="Include word-level timestamps"),
 ):
     """Transcribe an audio file using Parakeet TDT with dynamic batching."""
-    max_duration = config.get("batcher", {}).get("max_audio_duration", 600)
+    max_size = config.get("batcher", {}).get("max_audio_duration", 600) * 16000 * 2  # approx bytes at 16kHz PCM16
 
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
         shutil.copyfileobj(file.file, tmp)
+
+    file_size = os.path.getsize(tmp_path)
+    if file_size > max_size:
+        os.unlink(tmp_path)
+        raise HTTPException(status_code=413, detail=f"Audio too long (max {max_size // 32000}s at 16kHz)")
 
     try:
         result = await batch_engine.submit(tmp_path, timestamps=timestamps)

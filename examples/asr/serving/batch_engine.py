@@ -124,19 +124,27 @@ class BatchEngine:
             batch = self._pending[: self._max_batch_size]
             self._pending = self._pending[self._max_batch_size:]
 
-        audio_paths = [r.audio_path for r in batch]
-        any_timestamps = any(r.timestamps for r in batch)
+        # Partition by timestamps option so we don't mix decode settings
+        ts_batch = [r for r in batch if r.timestamps]
+        no_ts_batch = [r for r in batch if not r.timestamps]
 
-        log.info(f"Flushing batch: {len(batch)} files")
         self._metrics["total_batches"] += 1
         self._metrics["total_files"] += len(batch)
+        log.info(f"Flushing batch: {len(batch)} files (ts={len(ts_batch)}, no_ts={len(no_ts_batch)})")
 
+        for sub_batch, timestamps in [(no_ts_batch, False), (ts_batch, True)]:
+            if not sub_batch:
+                continue
+            await self._run_sub_batch(sub_batch, timestamps)
+
+    async def _run_sub_batch(self, batch: list[PendingRequest], timestamps: bool) -> None:
+        audio_paths = [r.audio_path for r in batch]
         try:
             gpu_future = self._gpu_worker.submit(
                 WorkType.BATCH_TRANSCRIBE,
                 {
                     "audio_paths": audio_paths,
-                    "timestamps": any_timestamps,
+                    "timestamps": timestamps,
                     "batch_size": len(batch),
                 },
                 self._loop,
