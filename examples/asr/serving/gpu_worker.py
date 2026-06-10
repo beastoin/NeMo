@@ -65,6 +65,7 @@ class GPUWorker:
         self._stream_pipeline = None
         self._stream_sessions: dict[str, dict] = {}
         self._next_stream_int_id = 1
+        self._source_language = "English"
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
@@ -241,6 +242,10 @@ class GPUWorker:
             overrides["streaming"] = {"att_context_size": context}
             log.info(f"Streaming latency mode: {latency_mode} (att_context_size={context})")
 
+        source_lang = self._stream_cfg.get("source_language", "English")
+        overrides["source_language"] = source_lang
+        self._source_language = source_lang
+
         cfg = OmegaConf.merge(base_cfg, overrides)
 
         self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)
@@ -295,7 +300,15 @@ class GPUWorker:
         session["chunk_index"] = chunk_index + 1
 
         samples = torch.tensor(audio_chunk, dtype=torch.float32)
-        options = ASRRequestOptions(enable_itn=False, enable_nmt=False) if is_first else None
+        options = (
+            ASRRequestOptions(
+                enable_itn=False,
+                enable_nmt=False,
+                source_language=self._source_language,
+            )
+            if is_first
+            else None
+        )
 
         frame = Frame(
             samples=samples,

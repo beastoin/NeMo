@@ -19,6 +19,7 @@ stream_model:
   amp: true
   # Streaming latency mode: "80ms", "160ms", "480ms", "1040ms"
   latency_mode: "480ms"
+  source_language: "English"
 
 batcher:
   max_batch_size: 32
