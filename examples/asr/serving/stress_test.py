@@ -52,7 +52,7 @@ _CACHE_DIR = os.path.join(tempfile.gettempdir(), "asr-test-audio")
 QUALITY_SAMPLES = [
     {
         "url": "https://dldata-public.s3.us-east-2.amazonaws.com/2086-149220-0033.wav",
-        "expected_words": ["before", "time", "answer", "room", "question", "leave"],
+        "expected_words": ["wish", "see", "phoebe", "portrait"],
         "name": "librispeech-2086",
         "min_words": 10,
     },
@@ -189,10 +189,15 @@ def prepare_quality_audio() -> list[dict]:
     return samples
 
 
+def _strip_punct(text: str) -> str:
+    """Strip trailing punctuation from each word for fair WER comparison."""
+    return " ".join(w.strip(".,!?;:\"'") for w in text.split())
+
+
 def compute_wer(reference: str, hypothesis: str) -> float:
     """Word Error Rate between reference and hypothesis."""
-    ref_words = reference.lower().split()
-    hyp_words = hypothesis.lower().split()
+    ref_words = _strip_punct(reference.lower()).split()
+    hyp_words = _strip_punct(hypothesis.lower()).split()
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
 
