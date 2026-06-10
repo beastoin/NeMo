@@ -92,6 +92,11 @@ spec:
                           h = await r.json()
                           print(f"Health: {h}")
 
+                      # Apply optimal config via admin API
+                      async with s.post(f"{SERVER}/admin/config?max_queue_depth=4096&max_batch_size=96&max_wait_seconds=0.002") as r:
+                          cfg = await r.json()
+                          print(f"Config applied: {cfg}")
+
                       # Network baseline
                       lats = []
                       for _ in range(100):
