@@ -90,19 +90,26 @@ class StreamEngine:
 
     async def open_stream(self, latency_mode: Optional[str] = None) -> dict:
         """Open a new streaming session. Returns stream_id."""
+        stream_id = str(uuid.uuid4())
+
+        # Reserve the slot before awaiting GPU to prevent concurrent opens
+        # from exceeding the limit
         if len(self._sessions) >= self._max_concurrent:
             raise TooManyStreamsError(
                 f"Active streams {len(self._sessions)} at limit {self._max_concurrent}"
             )
-
-        stream_id = str(uuid.uuid4())
-        result = await self._gpu_worker.submit(
-            WorkType.STREAM_OPEN,
-            {"stream_id": stream_id, "latency_mode": latency_mode},
-            self._loop,
-        )
-
         self._sessions[stream_id] = StreamSession(stream_id=stream_id)
+
+        try:
+            result = await self._gpu_worker.submit(
+                WorkType.STREAM_OPEN,
+                {"stream_id": stream_id, "latency_mode": latency_mode},
+                self._loop,
+            )
+        except Exception:
+            self._sessions.pop(stream_id, None)
+            raise
+
         self._metrics["total_streams_opened"] += 1
         log.info(f"Opened stream {stream_id} (active: {len(self._sessions)})")
         return result
