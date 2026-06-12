@@ -280,7 +280,37 @@ class GPUWorker:
             timestamps=timestamps,
             return_hypotheses=timestamps,
         )
-        return results
+        # Serialize on the GPU thread to prevent CUDA tensor references from
+        # crossing thread boundaries.  NeMo result objects hold internal CUDA
+        # tensors; if they are GC'd on the async server thread the CUDA host
+        # allocator segfaults (signal 139).
+        serialized = self._extract_results(results, timestamps)
+        del results
+        return serialized
+
+    @staticmethod
+    def _extract_results(results, timestamps: bool) -> list:
+        """Convert NeMo results to plain Python objects on the GPU thread."""
+        out = []
+        items = results if isinstance(results, list) else [results]
+        for r in items:
+            if timestamps and hasattr(r, 'text') and hasattr(r, 'timestamp'):
+                ts = {}
+                if isinstance(r.timestamp, dict):
+                    for k, entries in r.timestamp.items():
+                        if k == 'timestep':
+                            continue
+                        ts[k] = [
+                            {ek: (round(ev, 4) if isinstance(ev, float) else str(ev) if not isinstance(ev, (int, str)) else ev)
+                             for ek, ev in e.items()}
+                            for e in entries
+                        ]
+                out.append({"text": str(r.text), "timestamp": ts})
+            elif hasattr(r, 'text'):
+                out.append(str(r.text))
+            else:
+                out.append(str(r))
+        return out
 
     def _stream_open(self, payload: dict) -> dict:
         if self._stream_pipeline is None:
