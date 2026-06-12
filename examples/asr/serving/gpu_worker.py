@@ -21,6 +21,7 @@ thread via a work queue.
 """
 
 import asyncio
+import gc
 import logging
 import os
 import queue
@@ -145,6 +146,11 @@ class GPUWorker:
                 item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+            finally:
+                # Force GC on the GPU thread so NeMo's internal generators
+                # and their CUDA tensors are collected here, not on the
+                # async thread where CachingHostAllocator would segfault.
+                gc.collect()
 
         for q in (self._stream_queue, self._batch_queue):
             while not q.empty():
