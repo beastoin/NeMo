@@ -15,7 +15,7 @@ batch_model:
   amp: true
 
 batcher:
-  max_batch_size: 96
+  max_batch_size: 32
   max_wait_seconds: 0.002
   max_queue_depth: 4096
   max_upload_bytes: 104857600
