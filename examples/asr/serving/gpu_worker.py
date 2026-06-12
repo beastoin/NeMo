@@ -216,6 +216,10 @@ class GPUWorker:
 
     def _build_stream_pipeline(self) -> None:
         """Build the streaming pipeline using NeMo's cache_aware_rnnt config."""
+        if not self._stream_cfg or not self._stream_cfg.get("name"):
+            log.info("No stream model configured, streaming will be unavailable")
+            return
+
         from omegaconf import OmegaConf
 
         from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder

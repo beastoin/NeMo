@@ -24,7 +24,7 @@ stream_model:
 batcher:
   max_batch_size: 96  # L4 GPU batch sweet spot (chaos-tested: 96 > 64 > 32)
   max_wait_seconds: 0.002  # near-instant flush — 0.1s wasted 100ms GPU idle per cycle
-  max_queue_depth: 2048  # headroom for burst absorption
+  max_queue_depth: 4096  # in-cluster test: 256 caused 27K failures, 4096 prevents cascade
   max_upload_bytes: 104857600  # 100MB per file — hard limit on upload size
 
 stream:

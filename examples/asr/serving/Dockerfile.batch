@@ -1,0 +1,40 @@
+# Lightweight batch-only Parakeet TDT server.
+# ~5GB vs ~20GB full NeMo image. No streaming dependencies.
+#
+# Build:  docker build -f examples/asr/serving/Dockerfile.batch -t parakeet-batch .
+# Run:    docker run --gpus all -p 8000:8000 parakeet-batch
+
+FROM nvcr.io/nvidia/pytorch:24.12-py3
+
+WORKDIR /app/serving
+
+RUN pip install --no-cache-dir \
+    "nemo_toolkit[asr]>=2.2.0" \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.30.0" \
+    "python-multipart>=0.0.6" \
+    "pyyaml>=6.0"
+
+COPY examples/asr/serving/server.py \
+     examples/asr/serving/gpu_worker.py \
+     examples/asr/serving/batch_engine.py \
+     examples/asr/serving/stream_engine.py \
+     ./
+
+COPY examples/asr/serving/conf/ conf/
+
+# Pre-download model weights into the image (optional — remove to download at startup)
+RUN python -c "import nemo.collections.asr as asr; asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-0.6b-v3')" \
+    || echo "Model will be downloaded at first startup"
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV HF_HOME=/app/.cache/huggingface
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8000"]
