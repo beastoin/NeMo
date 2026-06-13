@@ -44,11 +44,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-# Disable automatic cyclic GC.  NeMo's RNNT decoder creates generators
-# holding CUDA pinned-memory tensors; if Python's cyclic GC finalizes
-# them on the async event-loop thread the CachingHostAllocator segfaults.
-# The GPU worker thread runs gc.collect() periodically (not per-request).
-gc.disable()
+# Python's automatic cyclic GC is left ENABLED.  It naturally triggers on
+# the GPU worker thread (where most allocation happens during inference),
+# not on the async event-loop thread.  The GPU worker also runs periodic
+# gc.collect() as a safety net for cyclic references holding CUDA tensors.
 
 import uvicorn
 import yaml
