@@ -44,10 +44,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-# Python's automatic cyclic GC is left ENABLED.  It naturally triggers on
-# the GPU worker thread (where most allocation happens during inference),
-# not on the async event-loop thread.  The GPU worker also runs periodic
-# gc.collect() as a safety net for cyclic references holding CUDA tensors.
+# Disable Python's automatic cyclic GC.  Under sustained load, automatic GC
+# can trigger on the async event-loop thread and free CUDA pinned-memory
+# tensors there, crashing in CachingHostAllocatorImpl::free().  The GPU
+# worker calls gc.collect() after every batch on its own thread instead.
+gc.disable()
 
 import uvicorn
 import yaml

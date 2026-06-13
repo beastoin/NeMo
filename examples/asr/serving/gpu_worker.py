@@ -87,23 +87,11 @@ class GPUWorker:
         self._batch_cfg = batch_cfg
         self._stream_cfg = stream_cfg
         self._running = True
-        self._gc_interval = batch_cfg.get("gc_interval", 100)
-        self._gc_time_limit = batch_cfg.get("gc_time_limit", 60.0)
-        self._gc_counter = 0
-        self._gc_last_time = time.monotonic()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="gpu-worker")
         self._thread.start()
 
     def _maybe_gc(self) -> None:
-        self._gc_counter += 1
-        now = time.monotonic()
-        if self._gc_counter >= self._gc_interval or (now - self._gc_last_time) >= self._gc_time_limit:
-            collected = gc.collect()
-            elapsed = time.monotonic() - now
-            if collected:
-                log.debug(f"Periodic GC: collected {collected} objects in {elapsed*1000:.1f}ms")
-            self._gc_counter = 0
-            self._gc_last_time = time.monotonic()
+        gc.collect()
 
     def wait_ready(self, timeout: float = 600) -> None:
         """Block until models are loaded. Raises if loading failed or timed out."""
