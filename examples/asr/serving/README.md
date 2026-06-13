@@ -4,12 +4,12 @@ High-throughput batch transcription server for NVIDIA NeMo Parakeet TDT 0.6B. Dy
 
 ## Performance
 
-| GPU | Sustained RPS | torch.compile | CUDA Graphs | Failures | Cost (spot) | Daily Capacity |
-|-----|:------------:|:-------------:|:-----------:|:--------:|:-----------:|:--------------:|
-| **L4** (24GB) | **49.6** | Yes | Yes | 0 | $0.50/hr | 4.3M req |
-| **T4** (16GB) | **6.4** | Yes | No | 0 | $0.35/hr | 553K req |
+| GPU | Sustained RPS | torch.compile | CUDA Graphs | Prefetch | Failures | Cost (spot) | Daily Capacity |
+|-----|:------------:|:-------------:|:-----------:|:--------:|:--------:|:-----------:|:--------------:|
+| **L4** (24GB) | **49.6** | Yes | Yes | — | 0 | $0.50/hr | 4.3M req |
+| **T4** (16GB) | **6.9** | Yes | No | Yes | 0 | $0.35/hr | 596K req |
 
-L4 is **4.4x more cost-efficient** per request ($0.0028 vs $0.0123 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
+L4 is **3.9x more cost-efficient** per request ($0.0028 vs $0.0114 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
 
 All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
 
@@ -105,7 +105,7 @@ python server.py --config conf/serving-batch.yaml
 kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml
 ```
 
-**T4 GPU — budget** (6.4 RPS, $0.35/hr spot):
+**T4 GPU — budget** (6.9 RPS, $0.35/hr spot):
 ```bash
 kubectl apply -f k8s/deployment-t4.yaml -f k8s/service.yaml
 ```
@@ -201,10 +201,10 @@ curl -X POST "http://localhost:8000/admin/config?max_batch_size=64&max_wait_seco
 
 Two batch configs are included:
 
-| Config | File | GPU | torch.compile | CUDA Graphs |
-|--------|------|-----|:-------------:|:-----------:|
-| **L4 production** | `conf/serving-batch.yaml` | L4 (24GB) | Yes | Yes |
-| **T4 budget** | `conf/serving-batch-t4.yaml` | T4 (16GB) | Yes | No |
+| Config | File | GPU | torch.compile | CUDA Graphs | Prefetch |
+|--------|------|-----|:-------------:|:-----------:|:--------:|
+| **L4 production** | `conf/serving-batch.yaml` | L4 (24GB) | Yes | Yes | No |
+| **T4 budget** | `conf/serving-batch-t4.yaml` | T4 (16GB) | Yes | No | Yes |
 
 ```yaml
 server:
@@ -218,6 +218,7 @@ batch_model:
   compile: true                 # +20-30% throughput, ~60s warmup on first inference
   amp: true                     # Automatic mixed precision
   cuda_graphs: true             # RNNT decoder CUDA graphs (disable on T4, see below)
+  prefetch: false               # Pre-read audio into tensors on background thread (see below)
 
 batcher:
   max_batch_size: 32            # Optimal with torch.compile (see tuning guide)
@@ -238,6 +239,10 @@ batcher:
 
 **`cuda_graphs`**: NeMo's RNNT decoder uses CUDA Graph conditional nodes compiled via NVRTC for faster decoding. These work on Ada Lovelace+ (L4, A100) but cause `cudaErrorIllegalAddress` on Turing (T4, compute capability 7.5). **Set `cuda_graphs: false` for T4 deployments.** Default is `true`.
 
+**`prefetch`**: Pre-reads audio files into numpy arrays on a background thread and passes tensors directly to `model.transcribe()`, bypassing NeMo's Lhotse DataLoader and manifest creation overhead. Gives **+7% throughput and -24% latency** on T4. Recommended for T4 deployments where every bit of performance matters. Default is `false`.
+
+**`model_pool_size`**: Loads N model copies with N worker threads for round-robin dispatch. **Not recommended on T4** — 3 models consume 97% of 16GB VRAM, leaving no headroom for inference buffers. Only viable on A100 (80GB) or multi-GPU setups.
+
 **GPU optimizations** (applied automatically): `cudnn.benchmark=True` (optimal convolution algorithms), `set_float32_matmul_precision('high')` (tensor core utilization).
 
 ## Scaling
@@ -250,17 +255,17 @@ The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
 | Replicas | L4 RPS | T4 RPS | L4 Daily Capacity |
 |:--------:|:------:|:------:|:-----------------:|
-| 1 | 49.6 | 6.4 | 4.3M |
-| 2 | ~99 | ~13 | 8.6M |
-| 4 | ~198 | ~26 | 17.1M |
+| 1 | 49.6 | 6.9 | 4.3M |
+| 2 | ~99 | ~14 | 8.6M |
+| 4 | ~198 | ~28 | 17.1M |
 
 ### GPU Selection
 
-| GPU | VRAM | RPS | torch.compile | CUDA Graphs | Spot $/hr | $/1K req | Best For |
-|-----|:----:|:---:|:-------------:|:-----------:|:---------:|:--------:|----------|
-| **L4** | 24GB | 49.6 | Yes | Yes | $0.50 | $0.0028 | Production |
-| **T4** | 16GB | 6.4 | Yes | No | $0.35 | $0.0123 | Dev/staging, low traffic |
-| A100 | 80GB | ~100+ | Yes | Yes | $1.50+ | ~$0.004 | Maximum throughput |
+| GPU | VRAM | RPS | torch.compile | CUDA Graphs | Prefetch | Spot $/hr | $/1K req | Best For |
+|-----|:----:|:---:|:-------------:|:-----------:|:--------:|:---------:|:--------:|----------|
+| **L4** | 24GB | 49.6 | Yes | Yes | — | $0.50 | $0.0028 | Production |
+| **T4** | 16GB | 6.9 | Yes | No | Yes | $0.35 | $0.0114 | Dev/staging, low traffic |
+| A100 | 80GB | ~100+ | Yes | Yes | — | $1.50+ | ~$0.004 | Maximum throughput |
 
 ### Deployment Patterns
 
@@ -268,7 +273,7 @@ The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
 **Multi-region**: Deploy identical stacks per region. The server is stateless — no cross-replica coordination needed.
 
-**Cost-optimized**: Use T4 spot instances for dev/staging. Switch to L4 for production. The same image and config work on both — only `cuda_graphs: true/false` differs.
+**Cost-optimized**: Use T4 spot instances for dev/staging. Switch to L4 for production. The same image and config work on both — T4 needs `cuda_graphs: false` and `prefetch: true`.
 
 **Burst handling**: The 4096-deep queue absorbs traffic spikes. For sustained high load, scale replicas rather than increasing queue depth.
 
@@ -345,5 +350,6 @@ This server addresses four issues in NeMo's transcription path:
 
 - **Single GPU per instance**: Scale horizontally for more throughput.
 - **T4 requires `cuda_graphs: false`**: CUDA Graph conditional nodes in the RNNT decoder crash on Turing architecture (compute capability 7.5). Throughput impact is minor (~5%).
+- **Multi-model pool not viable on T4**: 3 model copies consume 97% of 16GB VRAM (14.5/14.9GB), leaving no headroom for inference activation tensors. Crashes under concurrent load. Only viable on GPUs with 40GB+ VRAM.
 - **torch.compile warmup**: First inference takes ~60s for kernel compilation. Health probe `startupProbe` in K8s handles this gracefully.
 - **workers=1 required**: GPU models are not fork-safe. Do not set `workers > 1`.
