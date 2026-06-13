@@ -147,9 +147,11 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
             finally:
-                # Force GC on the GPU thread so NeMo's internal generators
-                # and their CUDA tensors are collected here, not on the
-                # async thread where CachingHostAllocator would segfault.
+                # Ensure all async CUDA operations complete before GC.
+                # NeMo's RNNT decoder uses pinned-memory tensors that must
+                # be fully synchronized before their generators can be
+                # safely finalized.
+                torch.cuda.synchronize()
                 gc.collect()
 
         for q in (self._stream_queue, self._batch_queue):
