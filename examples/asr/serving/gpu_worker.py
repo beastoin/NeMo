@@ -287,6 +287,8 @@ class GPUWorker:
             batch_size=batch_size,
             timestamps=timestamps,
             return_hypotheses=timestamps,
+            num_workers=0,
+            verbose=False,
         )
         # Serialize on the GPU thread to prevent CUDA tensor references from
         # crossing thread boundaries.  NeMo result objects hold internal CUDA
