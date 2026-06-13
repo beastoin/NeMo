@@ -341,6 +341,13 @@ class TranscriptionMixin(ABC):
                     )
         except StopIteration:
             pass
+        finally:
+            # Eagerly finalize the generator so its DataLoader (with
+            # pin_memory tensors) is freed on the caller's thread, not
+            # deferred to GC which may run on a different thread and
+            # crash in CachingHostAllocatorImpl::free().
+            generator.close()
+            del generator
 
         return results
 
@@ -405,6 +412,12 @@ class TranscriptionMixin(ABC):
                     yield processed_outputs
 
                     del processed_outputs
+
+                # Eagerly release the DataLoader and its pinned-memory
+                # buffers on the current thread.  If deferred to GC on a
+                # different thread, CachingHostAllocatorImpl::free() will
+                # segfault.
+                del dataloader
 
         finally:
             # set mode back to its original value

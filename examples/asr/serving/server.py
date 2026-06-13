@@ -33,6 +33,7 @@ Usage:
 
 import asyncio
 import functools
+import gc
 import json
 import logging
 import os
@@ -42,6 +43,12 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+
+# Disable automatic cyclic GC.  NeMo's RNNT decoder creates generators
+# holding CUDA pinned-memory tensors; if Python's cyclic GC finalizes
+# them on the async event-loop thread the CachingHostAllocator segfaults.
+# The GPU worker thread calls gc.collect() explicitly after each dispatch.
+gc.disable()
 
 import uvicorn
 import yaml
