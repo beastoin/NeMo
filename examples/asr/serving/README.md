@@ -1,6 +1,6 @@
-# NeMo ASR Serving
+# NeMo ASR Batch Serving
 
-High-performance ASR inference server for NVIDIA NeMo Parakeet TDT and Nemotron Streaming models. Single GPU, dynamic batching, zero-failure production deployments.
+High-throughput batch transcription server for NVIDIA NeMo Parakeet TDT 0.6B. Dynamic batching on a single GPU, zero-failure production deployments, deploy anywhere from Docker to Kubernetes.
 
 ## Performance
 
@@ -9,27 +9,55 @@ High-performance ASR inference server for NVIDIA NeMo Parakeet TDT and Nemotron 
 | **L4** (24GB) | **49.6** | Yes | 0 | $0.50/hr | 4.3M req |
 | **T4** (16GB) | **6.0** | No | 0 | $0.35/hr | 518K req |
 
-L4 is 5.8x more cost-efficient per request. T4 is viable for low-traffic or budget-constrained deployments.
+L4 is **5.8x more cost-efficient** per request ($0.0028 vs $0.0162 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
+
+All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
 
 ## Architecture
 
 ```
-Clients ──► FastAPI Server ──► Dynamic Batcher ──► GPU Worker Thread ──► NeMo Model
-  │              │                    │                    │
-  │         REST /v1/transcribe   Collects requests    Single thread
-  │         WS   /v1/stream       Flushes by size      torch.inference_mode
-  │                                or timer             gc.collect per dispatch
-  │
-  └── 503 backpressure when queue full
+                         ┌─────────────────────────────────────────────┐
+                         │              FastAPI Server                 │
+                         │         (async, single process)             │
+                         └──────┬──────────────────┬──────────────────┘
+                                │                  │
+                     POST /v1/transcribe    POST /v1/transcribe/batch
+                         (single file)        (up to 64 files)
+                                │                  │
+                                ▼                  ▼
+                         ┌─────────────────────────────────────────────┐
+                         │           Dynamic Batch Engine              │
+                         │                                             │
+                         │  Collects incoming requests into batches.   │
+                         │  Flushes when:                              │
+                         │    • max_batch_size reached (default: 32)   │
+                         │    • max_wait_seconds elapsed (default: 2ms)│
+                         │  Backpressure: 503 when queue > 4096        │
+                         └──────────────────┬──────────────────────────┘
+                                            │
+                                      Work Queue
+                                            │
+                                            ▼
+                         ┌─────────────────────────────────────────────┐
+                         │          GPU Worker Thread                  │
+                         │                                             │
+                         │  Single dedicated thread for all inference. │
+                         │  • torch.inference_mode()                   │
+                         │  • Serializes results to plain Python dicts │
+                         │  • gc.collect() after each dispatch         │
+                         │  • cudnn.benchmark + float32 high precision │
+                         └──────────────────┬──────────────────────────┘
+                                            │
+                                            ▼
+                         ┌─────────────────────────────────────────────┐
+                         │     Parakeet TDT 0.6B (torch.compile)      │
+                         │           ~4GB VRAM, batch=32               │
+                         └─────────────────────────────────────────────┘
 ```
 
-All GPU inference runs on a **single dedicated thread** to avoid CUDA context contention. The server is async (FastAPI + uvicorn) but GPU work is serialized through a work queue.
+**Why a single GPU thread?** NeMo models hold CUDA state that is not thread-safe. A dedicated thread avoids CUDA context contention, prevents cross-thread tensor GC segfaults, and gives predictable latency. The async server handles I/O concurrency while the GPU thread handles compute.
 
-Key design decisions:
-- **Dynamic batching**: Incoming requests are collected and flushed as a batch when `max_batch_size` is reached or `max_wait_seconds` elapses. This is the primary throughput lever.
-- **Priority queues**: Streaming requests get priority over batch to minimize real-time latency.
-- **Result serialization on GPU thread**: NeMo result objects hold CUDA tensors internally. They are converted to plain Python dicts on the GPU thread to prevent cross-thread CUDA segfaults.
-- **Forced GC on GPU thread**: `gc.collect()` after each dispatch ensures NeMo's internal generators (which hold CUDA pinned-memory tensors) are collected on the correct thread.
+**Why dynamic batching?** Individual requests arrive at random times. Without batching, each request runs alone on the GPU — wasting parallel compute capacity. The batch engine collects requests and flushes them as one GPU batch, which is the primary throughput lever (1 RPS serial vs 49.6 RPS batched on L4).
 
 ## Quick Start
 
@@ -39,66 +67,71 @@ Key design decisions:
 # From repo root:
 docker compose -f examples/asr/serving/docker-compose.yaml up -d
 
-# Check health:
+# Check health (model loading takes ~60-90s):
 curl http://localhost:8000/health
 
-# Transcribe:
+# Transcribe a file:
 curl -F file=@audio.wav http://localhost:8000/v1/transcribe
+
+# Transcribe multiple files:
+curl -F files=@a.wav -F files=@b.wav http://localhost:8000/v1/transcribe/batch
 ```
 
 Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
-### Docker (manual)
+### Docker (manual build)
 
 ```bash
-# Build (from repo root):
+# Build from repo root (~5GB image, PyTorch NGC base):
 docker build -f examples/asr/serving/Dockerfile.batch -t parakeet-batch .
 
 # Run:
 docker run --gpus all -p 8000:8000 parakeet-batch
 ```
 
-`Dockerfile.batch` uses the PyTorch NGC base image (~5GB) instead of the full NeMo image (~20GB).
-
 ### Bare Metal
 
 ```bash
-pip install nemo_toolkit[asr] fastapi uvicorn[standard] python-multipart pyyaml aiohttp numpy
+pip install nemo_toolkit[asr] fastapi uvicorn[standard] python-multipart pyyaml numpy
 
 cd examples/asr/serving
-python server.py --config conf/serving-batch.yaml --host 0.0.0.0 --port 8000
+python server.py --config conf/serving-batch.yaml
 ```
 
-### Kubernetes
+### Kubernetes (GKE)
 
+**L4 GPU — production** (49.6 RPS, $0.50/hr spot):
 ```bash
-# L4 GPU (production):
 kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml
+```
 
-# T4 GPU (budget):
+**T4 GPU — budget** (6.0 RPS, $0.35/hr spot):
+```bash
 kubectl apply -f k8s/deployment-t4.yaml -f k8s/service.yaml
 ```
+
+Both include health probes (startup/readiness/liveness), model cache PVC, and GPU tolerations. The L4 deployment includes HPA for auto-scaling 1-4 replicas.
 
 ## API Reference
 
 ### POST /v1/transcribe
 
-Transcribe a single audio file. The request is dynamically batched with other concurrent requests for GPU efficiency.
+Transcribe a single audio file. Dynamically batched with concurrent requests for GPU efficiency.
 
 ```bash
-# Basic transcription:
 curl -F file=@audio.wav http://localhost:8000/v1/transcribe
-
-# With word-level timestamps:
-curl -F file=@audio.wav "http://localhost:8000/v1/transcribe?timestamps=true"
 ```
 
-**Response:**
+Response:
 ```json
 {"text": "the quick brown fox jumps over the lazy dog", "audio_path": "/tmp/tmpXXXX.wav"}
 ```
 
-With `timestamps=true`:
+With word-level timestamps:
+```bash
+curl -F file=@audio.wav "http://localhost:8000/v1/transcribe?timestamps=true"
+```
+
 ```json
 {
   "text": "the quick brown fox",
@@ -109,41 +142,18 @@ With `timestamps=true`:
 
 ### POST /v1/transcribe/batch
 
-Transcribe multiple files in a single request. All files are batched together.
+Transcribe up to 64 files in a single request. All files are batched together for maximum GPU utilization.
 
 ```bash
 curl -F files=@audio1.wav -F files=@audio2.wav -F files=@audio3.wav \
   http://localhost:8000/v1/transcribe/batch
 ```
 
-**Response:**
 ```json
 {"results": [{"text": "...", "audio_path": "..."}, {"text": "...", "audio_path": "..."}, ...]}
 ```
 
-Max 64 files per request. Max file size: 100MB (configurable via `max_upload_bytes`).
-
-### WebSocket /v1/stream
-
-Real-time streaming ASR via WebSocket. Requires Nemotron Streaming model (configured in `serving.yaml`).
-
-```python
-import asyncio, websockets, json
-
-async def stream():
-    async with websockets.connect("ws://localhost:8000/v1/stream") as ws:
-        init = json.loads(await ws.recv())  # {"stream_id": "...", "status": "opened"}
-
-        # Send 16kHz mono PCM16 audio chunks:
-        await ws.send(audio_chunk_bytes)
-        result = json.loads(await ws.recv())
-        # {"partial_transcript": "the quick", "final_transcript": "", "is_final": false}
-
-        # Close:
-        await ws.send(json.dumps({"action": "close"}))
-        final = json.loads(await ws.recv())
-        # {"final_text": "the quick brown fox", "status": "closed"}
-```
+Max file size: 100MB (configurable via `max_upload_bytes`).
 
 ### GET /health
 
@@ -151,45 +161,52 @@ async def stream():
 {"status": "ok", "ready": true, "uptime_seconds": 1234.5}
 ```
 
+Returns `"status": "loading"` while the model is loading (~60-90s on first start).
+
 ### GET /metrics
 
 ```json
 {
   "uptime_seconds": 1234.5,
-  "batch": {"total_requests": 5000, "total_batches": 200, "total_files": 5000, "rejected_requests": 0, "pending_requests": 0},
-  "stream": {"total_streams_opened": 10, "total_streams_closed": 10, "total_chunks_processed": 5000, "active_streams": 0}
+  "batch": {
+    "total_requests": 5000,
+    "total_batches": 200,
+    "total_files": 5000,
+    "rejected_requests": 0,
+    "pending_requests": 3
+  }
 }
 ```
 
-### GET/POST /admin/config
+### POST /admin/config
 
-Live-tune server parameters without restart.
+Live-tune batch parameters without restart. Changes take effect immediately.
 
 ```bash
 # View current config:
 curl http://localhost:8000/admin/config
 
-# Tune (changes take effect immediately):
+# Tune:
 curl -X POST "http://localhost:8000/admin/config?max_batch_size=64&max_wait_seconds=0.01"
 ```
 
-Tunable parameters:
-- `max_batch_size` (1-256): GPU batch size
-- `max_wait_seconds` (0.001-5.0): Max time to wait before flushing a partial batch
-- `max_queue_depth` (16-8192): Max pending requests before 503
-- `gpu_poll_timeout` (0.001-1.0): GPU thread poll interval
+| Parameter | Range | Default | Description |
+|-----------|:-----:|:-------:|-------------|
+| `max_batch_size` | 1-256 | 32 | Files per GPU batch |
+| `max_wait_seconds` | 0.001-5.0 | 0.002 | Max wait before flushing partial batch |
+| `max_queue_depth` | 16-8192 | 4096 | Max pending requests (503 above this) |
+| `gpu_poll_timeout` | 0.001-1.0 | 0.05 | GPU thread poll interval |
 
 ## Configuration
 
-Three config presets are included:
+Two batch configs are included:
 
-| Config | File | Use Case |
-|--------|------|----------|
-| Full (batch + streaming) | `conf/serving.yaml` | Production with both models |
-| Batch-only | `conf/serving-batch.yaml` | Batch transcription only (saves ~2GB VRAM) |
-| T4 optimized | `conf/serving-batch-t4.yaml` | Cost-optimized for T4 GPU |
+| Config | File | GPU | torch.compile |
+|--------|------|-----|:-------------:|
+| **L4 production** | `conf/serving-batch.yaml` | L4 (24GB) | Yes |
+| **T4 budget** | `conf/serving-batch-t4.yaml` | T4 (16GB) | Yes* |
 
-### Config Reference
+*T4 config has `compile: true` in the file but should be set to `false` for concurrent workloads (see Tuning Guide).
 
 ```yaml
 server:
@@ -200,99 +217,80 @@ server:
 batch_model:
   name: "nvidia/parakeet-tdt-0.6b-v3"
   device: "cuda:0"
-  compile: true                 # torch.compile: +20-30% throughput, ~60s warmup
+  compile: true                 # +20-30% throughput, ~60s warmup on first inference
   amp: true                     # Automatic mixed precision
 
-stream_model:                   # Omit this section for batch-only mode
-  name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
-  device: "cuda:0"
-  compile: false
-  amp: true
-  latency_mode: "480ms"         # "80ms", "160ms", "480ms", "1040ms"
-  source_language: "English"
-
 batcher:
-  max_batch_size: 32            # Optimal with torch.compile on L4
-  max_wait_seconds: 0.002       # Near-instant flush — 0.1s wastes 100ms GPU idle per cycle
-  max_queue_depth: 4096         # Burst protection (256 caused cascading 503s in testing)
+  max_batch_size: 32            # Optimal with torch.compile (see tuning guide)
+  max_wait_seconds: 0.002       # Near-instant flush
+  max_queue_depth: 4096         # Burst absorption buffer
   max_upload_bytes: 104857600   # 100MB max per file
-
-stream:
-  max_concurrent_streams: 128
-  chunk_duration_ms: 160
-  sample_rate: 16000
-  max_stream_duration: 1800     # Auto-close streams after 30 minutes
-  max_chunk_bytes: 524288       # 512KB max per WebSocket frame
 ```
 
 ### Tuning Guide
 
-**Batch size**: With torch.compile, `batch_size=32` outperforms `batch_size=96` because smaller batches cycle through compiled kernels faster. Without torch.compile, larger batches (64-96) can be more efficient.
+**`max_batch_size`**: With torch.compile, `32` outperforms `96` because smaller batches cycle through compiled CUDA kernels faster. Without torch.compile (T4), try `64-96` for better GPU utilization.
 
-**max_wait_seconds**: Set to `0.002` (2ms). The default `0.1` (100ms) wastes GPU time waiting for more requests. At high load the batch fills before the timer fires anyway.
+**`max_wait_seconds`**: Keep at `0.002` (2ms). The default `0.1` (100ms) wastes GPU time idle-waiting. Under load, batches fill before the timer fires anyway. Under low load, 2ms latency is imperceptible.
 
-**max_queue_depth**: Set to `4096`. In testing, `256` caused cascading 503 failures under burst traffic. High queue depth absorbs bursts while the GPU catches up.
+**`max_queue_depth`**: Keep at `4096`. In load testing, `256` caused cascading 503 failures during traffic bursts. The deep queue absorbs spikes while the GPU catches up. Memory cost is negligible (only metadata is queued, not audio data).
 
-**torch.compile**: Enable on L4 and newer GPUs (Ada Lovelace+). Disable on T4 — concurrent compiled inference triggers CUDA segfaults on Turing architecture.
+**`torch.compile`**: Fuses GPU kernels for 20-30% throughput gain. Enable on L4 and newer (Ada Lovelace+). **Disable on T4** for concurrent workloads — compiled inference triggers CUDA segfaults on Turing architecture under concurrent load.
+
+**GPU optimizations** (applied automatically): `cudnn.benchmark=True` (optimal convolution algorithms), `set_float32_matmul_precision('high')` (tensor core utilization).
 
 ## Scaling
 
-### Horizontal (multi-GPU)
+### Horizontal Scaling
 
-Each server instance uses one GPU. Scale horizontally by adding replicas.
+Each server instance uses one GPU. Scale by adding replicas — requests are stateless.
 
-The included `k8s/hpa.yaml` provides HPA (Horizontal Pod Autoscaler) configuration:
-- Scale 1-4 replicas based on CPU utilization
-- 60s stabilization window for scale-up
-- 300s stabilization window for scale-down
+The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
-With 4x L4 GPUs: **~200 RPS** sustained.
+| Replicas | L4 RPS | T4 RPS | L4 Daily Capacity |
+|:--------:|:------:|:------:|:-----------------:|
+| 1 | 49.6 | 6.0 | 4.3M |
+| 2 | ~99 | ~12 | 8.6M |
+| 4 | ~198 | ~24 | 17.1M |
 
-### GPU Selection Guide
+### GPU Selection
 
-| GPU | VRAM | RPS | torch.compile | Cost/hr (spot) | Best For |
-|-----|:----:|:---:|:-------------:|:--------------:|----------|
-| L4 | 24GB | 49.6 | Yes | $0.50 | Production workloads |
-| T4 | 16GB | 6.0 | No | $0.35 | Dev/staging, low traffic |
-| A100 | 40/80GB | ~100+ | Yes | $1.50+ | High throughput |
+| GPU | VRAM | RPS | torch.compile | Spot $/hr | $/1K req | Best For |
+|-----|:----:|:---:|:-------------:|:---------:|:--------:|----------|
+| **L4** | 24GB | 49.6 | Yes | $0.50 | $0.0028 | Production |
+| **T4** | 16GB | 6.0 | No | $0.35 | $0.0162 | Dev/staging, low traffic |
+| A100 | 80GB | ~100+ | Yes | $1.50+ | ~$0.004 | Maximum throughput |
 
-### Capacity Planning
+### Deployment Patterns
 
-```
-daily_requests = rps * 86400
-```
+**Single-region production**: 2-4x L4 behind a load balancer. HPA scales based on queue depth or CPU. Model cache PVC avoids re-download on pod restart.
 
-| GPU | 1 replica | 2 replicas | 4 replicas |
-|-----|:---------:|:----------:|:----------:|
-| L4 | 4.3M/day | 8.6M/day | 17.1M/day |
-| T4 | 518K/day | 1.0M/day | 2.1M/day |
+**Multi-region**: Deploy identical stacks per region. The server is stateless — no cross-replica coordination needed.
+
+**Cost-optimized**: Use T4 spot instances for dev/staging. Switch to L4 for production. The same image and config work on both — only `compile: true/false` differs.
+
+**Burst handling**: The 4096-deep queue absorbs traffic spikes. For sustained high load, scale replicas rather than increasing queue depth.
 
 ## Benchmarking
 
-### Quick Stress Test
+### Quick Validation
 
 ```bash
 pip install aiohttp numpy
 
-# Batch throughput (default: 32 concurrent, 200 requests):
+# Throughput test (32 concurrent, 200 requests, synthetic audio):
 python stress_test.py --server http://localhost:8000 --mode batch
 
-# With real speech audio (requires espeak-ng):
-python stress_test.py --server http://localhost:8000 --mode batch --real-audio
+# With real speech audio (requires: apt install espeak-ng):
+python stress_test.py --server http://localhost:8000 --mode batch --real-audio --concurrency 16
 
-# Streaming:
-python stress_test.py --server http://localhost:8000 --mode stream --streams 16
-
-# Mixed batch + streaming:
-python stress_test.py --server http://localhost:8000 --mode mixed
-
-# Transcription quality (WER measurement):
+# Transcription quality (WER measurement against known text):
 python stress_test.py --server http://localhost:8000 --mode quality
 ```
 
-### Industrial Benchmark
+### Full Performance Characterization
 
-Full performance characterization: warmup, concurrency sweep (1-128), audio duration sweep (1s-60s), sustained load.
+Warmup, concurrency sweep (1-128), audio duration sweep (1s-60s), and sustained load test. Outputs a structured JSON report for capacity planning.
 
 ```bash
 python benchmark.py --server http://localhost:8000 --sustained-minutes 5 --output report.json
@@ -309,34 +307,40 @@ kubectl logs -f job/benchmark-configs
 
 ```
 examples/asr/serving/
-  server.py              # FastAPI application, REST + WebSocket endpoints
-  gpu_worker.py          # Dedicated GPU inference thread
-  batch_engine.py        # Dynamic batching engine
-  stream_engine.py       # Streaming session manager
-  stress_test.py         # Stress test + quality test client
-  benchmark.py           # Industrial performance benchmark
-  requirements-serving.txt
+  server.py                # FastAPI server, REST endpoints, health/metrics
+  gpu_worker.py            # Dedicated GPU inference thread
+  batch_engine.py          # Dynamic batching engine
+  stress_test.py           # Stress test + quality test client
+  benchmark.py             # Industrial performance benchmark
+  requirements-serving.txt # Python dependencies (NeMo assumed pre-installed)
 
   conf/
-    serving.yaml         # Full config (batch + streaming)
-    serving-batch.yaml   # Batch-only (no streaming model)
-    serving-batch-t4.yaml # T4 cost-optimized
+    serving-batch.yaml     # L4 production config
+    serving-batch-t4.yaml  # T4 budget config
 
-  Dockerfile             # Full NeMo image (batch + streaming)
-  Dockerfile.batch       # Lightweight batch-only (~5GB vs ~20GB)
-  docker-compose.yaml    # Single-command local deploy
+  Dockerfile.batch         # Lightweight batch image (~5GB, PyTorch NGC base)
+  docker-compose.yaml      # Single-command local deploy
 
   k8s/
-    deployment.yaml      # L4 production deployment + PVC
-    deployment-t4.yaml   # T4 budget deployment
-    service.yaml         # ClusterIP service
-    hpa.yaml             # Horizontal Pod Autoscaler
-    benchmark-configs.yaml # In-cluster benchmark job
+    deployment.yaml        # L4 deployment + model cache PVC
+    deployment-t4.yaml     # T4 budget deployment
+    service.yaml           # ClusterIP service
+    hpa.yaml               # Horizontal Pod Autoscaler (1-4 replicas)
 ```
+
+## Thread-Safety Fixes
+
+This server addresses three thread-safety bugs in NeMo's transcription path:
+
+1. **freeze/unfreeze race** (#15771): Concurrent `transcribe()` calls crash on `_frozen_grad_map`. Fixed by removing redundant freeze/unfreeze (covered by `@torch.inference_mode()`).
+
+2. **Cross-thread CUDA tensor GC**: NeMo's RNNT decoder holds CUDA pinned-memory tensors. When GC'd on the async thread instead of the GPU thread, `CachingHostAllocator` segfaults (signal 139). Fixed by serializing results to plain Python dicts on the GPU thread.
+
+3. **Residual generator leak**: NeMo's internal generators can outlive the function return. Fixed by `gc.collect()` on the GPU thread after each dispatch.
 
 ## Known Limitations
 
-- **Single GPU per instance**: The server binds to one GPU. Scale horizontally for more throughput.
-- **T4 concurrency cap**: Concurrent load above 16 can trigger CUDA host allocator segfaults on T4 (Turing architecture). This is a NeMo RNNT decoder thread-safety issue distinct from #15771.
-- **torch.compile warmup**: First inference after startup takes ~60 seconds for kernel compilation. Subsequent requests are fast.
-- **workers=1 required**: GPU models are not fork-safe. The `workers` config must be 1.
+- **Single GPU per instance**: Scale horizontally for more throughput.
+- **T4 concurrency cap at 16**: Higher concurrency triggers CUDA host allocator segfaults on Turing architecture. This is a NeMo-internal issue.
+- **torch.compile warmup**: First inference takes ~60s for kernel compilation. Health probe `startupProbe` in K8s handles this gracefully.
+- **workers=1 required**: GPU models are not fork-safe. Do not set `workers > 1`.
