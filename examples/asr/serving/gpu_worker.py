@@ -63,6 +63,13 @@ class GPUWorker:
         self._stream_queue: queue.Queue[WorkItem] = queue.Queue(maxsize=_MAX_GPU_QUEUE)
         self._thread: Optional[threading.Thread] = None
         self._batch_model = None
+        self._batch_models: list = []
+        self._pool_size = 1
+        self._pool_threads: list[threading.Thread] = []
+        self._pool_queues: list[queue.Queue] = []
+        self._next_pool_idx = 0
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_queue: Optional[queue.Queue] = None
         self._stream_pipeline = None
         self._stream_sessions: dict[str, dict] = {}
         self._next_stream_int_id = 1
@@ -109,7 +116,14 @@ class GPUWorker:
             fut.set_exception(RuntimeError("GPU worker not ready"))
             return fut
         fut = loop.create_future()
-        q = self._stream_queue if work_type != WorkType.BATCH_TRANSCRIBE else self._batch_queue
+        if work_type == WorkType.BATCH_TRANSCRIBE and self._pool_size > 1:
+            idx = self._next_pool_idx % self._pool_size
+            self._next_pool_idx += 1
+            q = self._pool_queues[idx]
+        elif work_type != WorkType.BATCH_TRANSCRIBE:
+            q = self._stream_queue
+        else:
+            q = self._batch_queue
         try:
             q.put_nowait(WorkItem(work_type, payload, fut, loop))
         except queue.Full:
@@ -127,9 +141,19 @@ class GPUWorker:
             self._ready.set()
             return
 
+        if self._pool_size > 1:
+            self._run_pool_mode()
+        elif self._batch_cfg.get("prefetch", False):
+            self._run_prefetch_mode()
+        else:
+            self._run_single_mode()
+
+        log.info("GPU worker thread stopped")
+
+    def _run_single_mode(self) -> None:
+        log.info("Running in single-model mode")
         while self._running:
             item = None
-            # Streaming gets priority — drain stream queue before batch
             try:
                 item = self._stream_queue.get_nowait()
             except queue.Empty:
@@ -147,14 +171,134 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
             finally:
-                # Ensure all async CUDA operations complete before GC.
-                # NeMo's RNNT decoder uses pinned-memory tensors that must
-                # be fully synchronized before their generators can be
-                # safely finalized.
                 torch.cuda.synchronize()
                 gc.collect()
 
-        for q in (self._stream_queue, self._batch_queue):
+        self._drain_queues([self._stream_queue, self._batch_queue])
+
+    def _run_pool_mode(self) -> None:
+        log.info(f"Running in pool mode: {self._pool_size} model workers")
+        for i in range(self._pool_size):
+            q = queue.Queue(maxsize=_MAX_GPU_QUEUE)
+            self._pool_queues.append(q)
+            t = threading.Thread(
+                target=self._pool_worker_loop, args=(i, self._batch_models[i], q),
+                daemon=True, name=f"gpu-pool-{i}",
+            )
+            self._pool_threads.append(t)
+            t.start()
+
+        # Main thread handles streaming only (if any)
+        while self._running:
+            try:
+                item = self._stream_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item.work_type == WorkType.SHUTDOWN:
+                break
+            try:
+                result = self._dispatch(item)
+                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+            except Exception as exc:
+                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+
+        for q in self._pool_queues:
+            dummy_loop = asyncio.new_event_loop()
+            try:
+                q.put(WorkItem(WorkType.SHUTDOWN, None, dummy_loop.create_future(), dummy_loop), timeout=5)
+            except queue.Full:
+                pass
+            dummy_loop.close()
+        for t in self._pool_threads:
+            t.join(timeout=30)
+
+    @torch.inference_mode()
+    def _pool_worker_loop(self, idx: int, model, q: queue.Queue) -> None:
+        stream = torch.cuda.Stream()
+        log.info(f"Pool worker {idx} started (stream={stream})")
+        while self._running:
+            try:
+                item = q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item.work_type == WorkType.SHUTDOWN:
+                break
+            try:
+                with torch.cuda.stream(stream):
+                    result = self._batch_transcribe_with_model(model, item.payload)
+                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+            except Exception as exc:
+                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+            finally:
+                stream.synchronize()
+                gc.collect()
+        log.info(f"Pool worker {idx} stopped")
+
+    def _run_prefetch_mode(self) -> None:
+        log.info("Running in prefetch mode (tensor bypass)")
+        self._prefetch_queue = queue.Queue(maxsize=4)
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop, daemon=True, name="prefetch"
+        )
+        self._prefetch_thread.start()
+
+        while self._running:
+            item = None
+            try:
+                item = self._stream_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    item = self._prefetch_queue.get(timeout=self._batch_poll_timeout)
+                except queue.Empty:
+                    continue
+
+            if item.work_type == WorkType.SHUTDOWN:
+                break
+
+            try:
+                result = self._dispatch(item)
+                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+            except Exception as exc:
+                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+            finally:
+                torch.cuda.synchronize()
+                gc.collect()
+
+        self._drain_queues([self._stream_queue, self._batch_queue])
+
+    def _prefetch_loop(self) -> None:
+        import numpy as np
+        import soundfile as sf
+
+        log.info("Prefetch thread started")
+        while self._running:
+            try:
+                item = self._batch_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item.work_type == WorkType.SHUTDOWN:
+                self._prefetch_queue.put(item)
+                break
+
+            if item.work_type == WorkType.BATCH_TRANSCRIBE:
+                try:
+                    audio_arrays = []
+                    for path in item.payload["audio_paths"]:
+                        data, sr = sf.read(path, dtype='float32')
+                        if sr != 16000:
+                            import librosa
+                            data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+                        audio_arrays.append(np.array(data, dtype=np.float32))
+                    item.payload["audio_tensors"] = audio_arrays
+                except Exception as exc:
+                    log.warning(f"Prefetch failed, falling back to paths: {exc}")
+
+            self._prefetch_queue.put(item)
+        log.info("Prefetch thread stopped")
+
+    def _drain_queues(self, queues) -> None:
+        for q in queues:
             while not q.empty():
                 try:
                     item = q.get_nowait()
@@ -164,8 +308,6 @@ class GPUWorker:
                         )
                 except queue.Empty:
                     break
-
-        log.info("GPU worker thread stopped")
 
     @staticmethod
     def _safe_set_result(future: asyncio.Future, result: Any) -> None:
@@ -189,34 +331,49 @@ class GPUWorker:
             return self._stream_close(item.payload)
         raise ValueError(f"Unknown work type: {item.work_type}")
 
+    def _load_one_model(self, nemo_asr, device, idx=0):
+        tag = f" (pool #{idx})" if self._pool_size > 1 else ""
+        log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
+        model = nemo_asr.models.ASRModel.from_pretrained(
+            self._batch_cfg["name"], map_location=device
+        )
+        model.eval()
+        if not self._batch_cfg.get("cuda_graphs", True):
+            if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
+                disabled = model.decoding.decoding.disable_cuda_graphs()
+                log.info(f"CUDA graph decoding disabled{tag} (was active: {disabled})")
+        if self._batch_cfg.get("compile", False):
+            log.info(f"Compiling batch model{tag} with torch.compile")
+            model = torch.compile(model)
+        return model
+
     def _load_models(self) -> None:
         import nemo.collections.asr as nemo_asr
 
         device = self._batch_cfg.get("device", "cuda:0")
+        self._pool_size = self._batch_cfg.get("model_pool_size", 1)
 
         torch.backends.cudnn.benchmark = True
         if hasattr(torch, 'set_float32_matmul_precision'):
             torch.set_float32_matmul_precision('high')
         log.info("Torch optimizations: cudnn.benchmark=True, matmul_precision=high")
 
-        log.info(f"Loading batch model: {self._batch_cfg['name']}")
-        self._batch_model = nemo_asr.models.ASRModel.from_pretrained(
-            self._batch_cfg["name"], map_location=device
-        )
-        self._batch_model.eval()
-
-        if not self._batch_cfg.get("cuda_graphs", True):
-            if hasattr(self._batch_model, 'decoding') and hasattr(self._batch_model.decoding, 'decoding'):
-                disabled = self._batch_model.decoding.decoding.disable_cuda_graphs()
-                log.info(f"CUDA graph decoding disabled (was active: {disabled})")
+        if self._pool_size > 1:
+            log.info(f"Loading model pool: {self._pool_size} instances")
+            for i in range(self._pool_size):
+                model = self._load_one_model(nemo_asr, device, i)
+                self._batch_models.append(model)
+                torch.cuda.empty_cache()
+            self._batch_model = self._batch_models[0]
+        else:
+            self._batch_model = self._load_one_model(nemo_asr, device)
 
         torch.cuda.empty_cache()
 
-        if self._batch_cfg.get("compile", False):
-            log.info("Compiling batch model with torch.compile")
-            self._batch_model = torch.compile(self._batch_model)
+        vram_used = torch.cuda.memory_allocated() / 1024**2
+        vram_total = torch.cuda.get_device_properties(0).total_mem / 1024**2
+        log.info(f"VRAM after model load: {vram_used:.0f}MiB / {vram_total:.0f}MiB")
 
-        # Stream model is loaded by the pipeline builder — no manual load needed
         self._build_stream_pipeline()
         log.info("Models loaded and ready")
 
@@ -283,22 +440,22 @@ class GPUWorker:
         log.info("Streaming pipeline built and session opened")
 
     def _batch_transcribe(self, payload: dict) -> list:
-        audio_paths = payload["audio_paths"]
+        return self._batch_transcribe_with_model(self._batch_model, payload)
+
+    def _batch_transcribe_with_model(self, model, payload: dict) -> list:
         timestamps = payload.get("timestamps", False)
         batch_size = payload.get("batch_size", 16)
 
-        results = self._batch_model.transcribe(
-            audio_paths,
+        audio_input = payload.get("audio_tensors", payload["audio_paths"])
+
+        results = model.transcribe(
+            audio_input,
             batch_size=batch_size,
             timestamps=timestamps,
             return_hypotheses=timestamps,
             num_workers=0,
             verbose=False,
         )
-        # Serialize on the GPU thread to prevent CUDA tensor references from
-        # crossing thread boundaries.  NeMo result objects hold internal CUDA
-        # tensors; if they are GC'd on the async server thread the CUDA host
-        # allocator segfaults (signal 139).
         serialized = self._extract_results(results, timestamps)
         del results
         return serialized
