@@ -205,6 +205,11 @@ class GPUWorker:
         )
         self._batch_model.eval()
 
+        if not self._batch_cfg.get("cuda_graphs", True):
+            if hasattr(self._batch_model, 'decoding') and hasattr(self._batch_model.decoding, 'decoding'):
+                disabled = self._batch_model.decoding.decoding.disable_cuda_graphs()
+                log.info(f"CUDA graph decoding disabled (was active: {disabled})")
+
         torch.cuda.empty_cache()
 
         if self._batch_cfg.get("compile", False):
