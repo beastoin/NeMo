@@ -6,10 +6,10 @@ High-throughput batch transcription server for NVIDIA NeMo Parakeet TDT 0.6B. Dy
 
 | GPU | Sustained RPS | torch.compile | CUDA Graphs | Prefetch | Failures | Cost (spot) | Daily Capacity |
 |-----|:------------:|:-------------:|:-----------:|:--------:|:--------:|:-----------:|:--------------:|
-| **L4** (24GB) | **47** | Yes | Yes | — | 0 | $0.50/hr | 4.1M req |
+| **L4** (24GB) | **43** | Yes | Yes | — | 0 | $0.50/hr | 3.7M req |
 | **T4** (16GB) | **6.9** | Yes | No | Yes | 0 | $0.35/hr | 596K req |
 
-L4 is **3.8x more cost-efficient** per request ($0.0030 vs $0.0114 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
+L4 is **3.6x more cost-efficient** per request ($0.0032 vs $0.0114 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
 
 All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
 
@@ -44,7 +44,7 @@ All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
                          │  Single dedicated thread for all inference. │
                          │  • torch.inference_mode()                   │
                          │  • Serializes results to plain Python dicts │
-                         │  • Periodic gc.collect() (every 100 req)     │
+                         │  • gc.collect(0) per batch, full gc/50       │
                          │  • cudnn.benchmark + float32 high precision │
                          └──────────────────┬──────────────────────────┘
                                             │
@@ -57,7 +57,7 @@ All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
 
 **Why a single GPU thread?** NeMo models hold CUDA state that is not thread-safe. A dedicated thread avoids CUDA context contention, prevents cross-thread tensor GC segfaults, and gives predictable latency. The async server handles I/O concurrency while the GPU thread handles compute.
 
-**Why dynamic batching?** Individual requests arrive at random times. Without batching, each request runs alone on the GPU — wasting parallel compute capacity. The batch engine collects requests and flushes them as one GPU batch, which is the primary throughput lever (1 RPS serial vs 47 RPS batched on L4).
+**Why dynamic batching?** Individual requests arrive at random times. Without batching, each request runs alone on the GPU — wasting parallel compute capacity. The batch engine collects requests and flushes them as one GPU batch, which is the primary throughput lever (1 RPS serial vs 43 RPS batched on L4).
 
 ## Quick Start
 
@@ -100,7 +100,7 @@ python server.py --config conf/serving-batch.yaml
 
 ### Kubernetes (GKE)
 
-**L4 GPU — production** (47 RPS, $0.50/hr spot):
+**L4 GPU — production** (43 RPS, $0.50/hr spot):
 ```bash
 kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml
 ```
@@ -255,15 +255,15 @@ The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
 | Replicas | L4 RPS | T4 RPS | L4 Daily Capacity |
 |:--------:|:------:|:------:|:-----------------:|
-| 1 | 47 | 6.9 | 4.1M |
-| 2 | ~94 | ~14 | 8.1M |
-| 4 | ~188 | ~28 | 16.2M |
+| 1 | 43 | 6.9 | 3.7M |
+| 2 | ~86 | ~14 | 7.4M |
+| 4 | ~172 | ~28 | 14.9M |
 
 ### GPU Selection
 
 | GPU | VRAM | RPS | torch.compile | CUDA Graphs | Prefetch | Spot $/hr | $/1K req | Best For |
 |-----|:----:|:---:|:-------------:|:-----------:|:--------:|:---------:|:--------:|----------|
-| **L4** | 24GB | 47 | Yes | Yes | — | $0.50 | $0.0030 | Production |
+| **L4** | 24GB | 43 | Yes | Yes | — | $0.50 | $0.0032 | Production |
 | **T4** | 16GB | 6.9 | Yes | No | Yes | $0.35 | $0.0114 | Dev/staging, low traffic |
 | A100 | 80GB | ~100+ | Yes | Yes | — | $1.50+ | ~$0.004 | Maximum throughput |
 
@@ -344,7 +344,7 @@ This server addresses four issues in NeMo's transcription path:
 
 3. **Cross-thread CUDA tensor GC**: NeMo's RNNT decoder holds CUDA pinned-memory tensors. When GC'd on the async thread instead of the GPU thread, `CachingHostAllocator` segfaults (signal 139). Fixed by serializing results to plain Python dicts on the GPU thread.
 
-4. **Residual generator leak**: NeMo's internal generators can outlive the function return. Fixed by eagerly closing generators and deleting DataLoaders inside `transcribe()`, plus periodic `gc.collect()` on the GPU thread (every 100 requests) as a safety net for cyclic references.
+4. **Residual generator leak**: NeMo's internal generators can outlive the function return. Fixed by eagerly closing generators and deleting DataLoaders inside `transcribe()`. Automatic GC is disabled (`gc.disable()`) to prevent the async event-loop thread from collecting CUDA tensors. Instead, `gc.collect(0)` runs on the GPU thread after every batch (cheap, scans only young objects), with a full `gc.collect()` every 50 batches.
 
 ## Known Limitations
 
