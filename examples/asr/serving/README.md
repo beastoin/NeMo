@@ -302,6 +302,8 @@ Warmup, concurrency sweep (1-128), audio duration sweep (1s-60s), and sustained 
 python benchmark.py --server http://localhost:8000 --sustained-minutes 5 --output report.json
 ```
 
+See [`benchmark-report.html`](benchmark-report.html) for a detailed L4/T4 performance report with GC strategy evolution, concurrency sweeps, and cost analysis.
+
 ### In-Cluster Benchmark (K8s)
 
 ```bash
@@ -318,6 +320,7 @@ examples/asr/serving/
   batch_engine.py          # Dynamic batching engine
   stress_test.py           # Stress test + quality test client
   benchmark.py             # Industrial performance benchmark
+  benchmark-report.html    # L4/T4 benchmark report (GC strategy, cost analysis)
   requirements-serving.txt # Python dependencies (NeMo assumed pre-installed)
 
   conf/
