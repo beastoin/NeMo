@@ -1,0 +1,36 @@
+# Batch-only Parakeet TDT server.
+# Uses PyTorch NGC base (~9GB) instead of full NeMo image (~20GB).
+#
+# Build:  docker build -f examples/asr/serving/Dockerfile.batch -t parakeet-batch .
+# Run:    docker run --gpus all -p 8000:8000 parakeet-batch
+
+FROM nvcr.io/nvidia/pytorch:24.12-py3
+
+WORKDIR /app/serving
+
+RUN pip install --no-cache-dir \
+    "nemo_toolkit[asr]>=2.2.0" \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.30.0" \
+    "python-multipart>=0.0.6" \
+    "pyyaml>=6.0"
+
+COPY examples/asr/serving/server.py \
+     examples/asr/serving/gpu_worker.py \
+     examples/asr/serving/batch_engine.py \
+     ./
+
+COPY examples/asr/serving/conf/serving-batch.yaml conf/serving-batch.yaml
+COPY examples/asr/serving/conf/serving-batch-t4.yaml conf/serving-batch-t4.yaml
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV HF_HOME=/app/.cache/huggingface
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["python", "server.py", "--config", "conf/serving-batch.yaml", "--host", "0.0.0.0", "--port", "8000"]

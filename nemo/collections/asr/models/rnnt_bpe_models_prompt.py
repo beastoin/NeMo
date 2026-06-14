@@ -245,7 +245,7 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             'trim_silence': False,
             'shuffle': False,
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
+            'pin_memory': config.get('pin_memory', True),
             'use_lhotse': config.get('use_lhotse', True),
             'use_bucketing': False,
             'drop_last': False,

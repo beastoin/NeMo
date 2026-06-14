@@ -1,0 +1,51 @@
+# Parakeet TDT batch ASR server — single command deploy.
+#
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f
+# Stop:    docker compose down
+# Health:  curl http://localhost:8000/health
+#
+# Requires: Docker with NVIDIA Container Toolkit (nvidia-docker2)
+# Install:  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+services:
+  parakeet-batch:
+    build:
+      context: ../../../..
+      dockerfile: examples/asr/serving/Dockerfile.batch
+    image: parakeet-batch:latest
+    container_name: parakeet-batch
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - model-cache:/app/.cache/huggingface
+      - /tmp/parakeet-uploads:/tmp
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          cpus: "4"
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  model-cache:

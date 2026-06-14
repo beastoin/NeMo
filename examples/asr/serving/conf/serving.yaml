@@ -1,0 +1,35 @@
+# High-performance ASR serving configuration.
+# Supports batch (Parakeet TDT) and streaming (Nemotron) models.
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1  # single process — GPU models are not fork-safe
+
+batch_model:
+  name: "nvidia/parakeet-tdt-0.6b-v3"
+  device: "cuda:0"
+  compile: true  # chaos-tested: +20-30% GPU speed after ~60s warmup
+  amp: true
+
+stream_model:
+  name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
+  device: "cuda:0"
+  compile: false
+  amp: true
+  # Streaming latency mode: "80ms", "160ms", "480ms", "1040ms"
+  latency_mode: "480ms"
+  source_language: "English"
+
+batcher:
+  max_batch_size: 32  # in-cluster benchmark: batch=32 beats 96 by 13% with torch.compile
+  max_wait_seconds: 0.002  # near-instant flush — 0.1s wasted 100ms GPU idle per cycle
+  max_queue_depth: 4096  # in-cluster test: 256 caused 27K failures, 4096 prevents cascade
+  max_upload_bytes: 104857600  # 100MB per file — hard limit on upload size
+
+stream:
+  max_concurrent_streams: 128
+  chunk_duration_ms: 160  # audio chunk size from client
+  sample_rate: 16000
+  max_stream_duration: 1800  # auto-close after 30 minutes
+  max_chunk_bytes: 524288  # 512KB max per WebSocket frame

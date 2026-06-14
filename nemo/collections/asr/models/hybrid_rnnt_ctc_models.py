@@ -176,18 +176,6 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
             override_config=override_config,
         )
 
-    def _transcribe_on_begin(self, audio, trcfg: TranscribeConfig):
-        super()._transcribe_on_begin(audio, trcfg)
-
-        if hasattr(self, 'ctc_decoder'):
-            self.ctc_decoder.freeze()
-
-    def _transcribe_on_end(self, trcfg: TranscribeConfig):
-        super()._transcribe_on_end(trcfg)
-
-        if hasattr(self, 'ctc_decoder'):
-            self.ctc_decoder.unfreeze(partial=True)
-
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         if self.cur_decoder == "rnnt":
             return super()._transcribe_forward(batch, trcfg)

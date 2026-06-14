@@ -1,0 +1,235 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parakeet-config-benchmark
+  namespace: dev-omi-backend
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: parakeet-config-benchmark
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: benchmark
+          image: python:3.12-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              apt-get update -qq && apt-get install -y -qq espeak-ng curl > /dev/null 2>&1
+              pip install -q aiohttp numpy
+
+              export PYTHONUNBUFFERED=1
+
+              cat > /tmp/bench.py << 'PYEOF'
+              import asyncio, aiohttp, io, json, struct, subprocess, os, time
+              import numpy as np
+
+              SERVER = os.environ.get("ASR_SERVER", "http://zen-asr-server:8000")
+
+              CONFIGS = [
+                  {
+                      "name": "L4 Optimal (batch=96, wait=0.002)",
+                      "params": {"max_batch_size": 96, "max_wait_seconds": 0.002, "max_queue_depth": 4096, "gpu_poll_timeout": 0.05},
+                      "tier": "l4-optimal",
+                  },
+                  {
+                      "name": "L4 Batch-Only Default (batch=96, wait=0.002)",
+                      "params": {"max_batch_size": 96, "max_wait_seconds": 0.002, "max_queue_depth": 4096, "gpu_poll_timeout": 0.05},
+                      "tier": "l4-batch",
+                  },
+                  {
+                      "name": "T4-Simulated (batch=48, wait=0.002)",
+                      "params": {"max_batch_size": 48, "max_wait_seconds": 0.002, "max_queue_depth": 4096, "gpu_poll_timeout": 0.05},
+                      "tier": "t4-simulated",
+                  },
+                  {
+                      "name": "Small Batch (batch=16, wait=0.002)",
+                      "params": {"max_batch_size": 16, "max_wait_seconds": 0.002, "max_queue_depth": 4096, "gpu_poll_timeout": 0.05},
+                      "tier": "small-batch",
+                  },
+                  {
+                      "name": "Original Default (batch=32, wait=0.1)",
+                      "params": {"max_batch_size": 32, "max_wait_seconds": 0.1, "max_queue_depth": 256, "gpu_poll_timeout": 0.05},
+                      "tier": "original-default",
+                  },
+              ]
+
+              CACHE = "/tmp/asr-audio"
+
+              def tts(text, path):
+                  try:
+                      subprocess.run(["espeak-ng","-w",path,"--stdin","-s","150","-a","100"],
+                                     input=text, text=True, capture_output=True, check=True, timeout=30)
+                      return True
+                  except: return False
+
+              def prep():
+                  os.makedirs(CACHE, exist_ok=True)
+                  files = []
+                  for i, s in enumerate(["The quick brown fox jumps over the lazy dog.",
+                                          "Artificial intelligence is transforming how we interact with technology.",
+                                          "Please remember to save your work before closing the application."]):
+                      p = f"{CACHE}/tts_{i}.wav"
+                      if not os.path.exists(p): tts(s, p)
+                      if os.path.exists(p):
+                          with open(p, "rb") as f: files.append(f.read())
+                  return files
+
+              async def apply_config(session, params):
+                  q = "&".join(f"{k}={v}" for k, v in params.items())
+                  async with session.post(f"{SERVER}/admin/config?{q}") as r:
+                      return await r.json()
+
+              async def measure(session, audio, conc, n, label=""):
+                  sem = asyncio.Semaphore(conc)
+                  ok, fail, lats = 0, 0, []
+                  async def one(idx):
+                      nonlocal ok, fail
+                      d = audio[idx % len(audio)]
+                      async with sem:
+                          t0 = time.monotonic()
+                          try:
+                              form = aiohttp.FormData()
+                              form.add_field("file", d, filename=f"b_{idx}.wav", content_type="audio/wav")
+                              async with session.post(f"{SERVER}/v1/transcribe", data=form) as r:
+                                  await r.json()
+                                  if r.status == 200: ok += 1; lats.append(time.monotonic()-t0)
+                                  else: fail += 1
+                          except: fail += 1
+                  t_wall = time.monotonic()
+                  await asyncio.gather(*[one(i) for i in range(n)])
+                  wall = time.monotonic() - t_wall
+                  lats.sort()
+                  return {"label": label, "conc": conc, "n": n, "ok": ok, "fail": fail,
+                          "wall_s": round(wall,2), "rps": round(ok/wall,2) if wall else 0,
+                          "p50": round(lats[len(lats)//2]*1000,1) if lats else 0,
+                          "p95": round(lats[int(len(lats)*0.95)]*1000,1) if lats else 0,
+                          "p99": round(lats[int(len(lats)*0.99)]*1000,1) if lats else 0}
+
+              async def sustained(session, audio, conc, duration_s):
+                  sem = asyncio.Semaphore(conc)
+                  deadline = time.monotonic() + duration_s
+                  ok_c, fail_c, all_lats, idx = 0, 0, [], 0
+                  active = []
+                  while time.monotonic() < deadline or active:
+                      while len(active) < conc * 2 and time.monotonic() < deadline:
+                          d = audio[idx % len(audio)]
+                          ts = time.monotonic()
+                          async def do(dd=d, tts=ts):
+                              nonlocal ok_c, fail_c
+                              async with sem:
+                                  try:
+                                      form = aiohttp.FormData()
+                                      form.add_field("file",dd,filename="s.wav",content_type="audio/wav")
+                                      async with session.post(f"{SERVER}/v1/transcribe",data=form) as rr:
+                                          await rr.json()
+                                          if rr.status==200: ok_c+=1; all_lats.append(time.monotonic()-tts)
+                                          else: fail_c+=1
+                                  except: fail_c+=1
+                          active.append(asyncio.create_task(do()))
+                          idx += 1
+                      if active:
+                          done, pend = await asyncio.wait(active, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                          active = list(pend)
+                          if time.monotonic() >= deadline:
+                              for t in active: await t
+                              active = []
+                  all_lats.sort()
+                  return {
+                      "duration": duration_s, "requests": ok_c+fail_c, "ok": ok_c, "fail": fail_c,
+                      "rps": round(ok_c/duration_s, 2),
+                      "p50": round(all_lats[len(all_lats)//2]*1000,1) if all_lats else 0,
+                      "p95": round(all_lats[int(len(all_lats)*0.95)]*1000,1) if all_lats else 0,
+                      "p99": round(all_lats[int(len(all_lats)*0.99)]*1000,1) if all_lats else 0,
+                  }
+
+              async def main():
+                  print(f"Server: {SERVER}")
+                  audio = prep()
+                  print(f"Audio samples: {len(audio)}")
+
+                  all_results = []
+
+                  for cfg in CONFIGS:
+                      print(f"\n{'='*60}")
+                      print(f"CONFIG: {cfg['name']}")
+                      print(f"{'='*60}")
+
+                      async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+                          # Apply config
+                          result = await apply_config(s, cfg["params"])
+                          print(f"Applied: {result}")
+
+                          # Wait for queue to drain
+                          await asyncio.sleep(2)
+
+                          # Warmup
+                          print("Warmup...")
+                          await measure(s, audio, 8, 30, "warmup")
+                          await asyncio.sleep(1)
+
+                          # Concurrency sweep
+                          sweep = []
+                          for conc in [1, 4, 8, 16, 32, 64]:
+                              r = await measure(s, audio, conc, 200, f"conc={conc}")
+                              sweep.append(r)
+                              print(f"  conc={conc}: {r['rps']} RPS, p50={r['p50']}ms, fail={r['fail']}")
+                              await asyncio.sleep(1)
+
+                          # Sustained 30s at conc=32
+                          print("Sustained 30s at conc=32...")
+                          sust = await sustained(s, audio, 32, 30)
+                          print(f"  Sustained: {sust['rps']} RPS, p50={sust['p50']}ms, fail={sust['fail']}")
+
+                          peak = max(sweep, key=lambda x: x["rps"])
+                          entry = {
+                              "config": cfg["name"],
+                              "tier": cfg["tier"],
+                              "params": cfg["params"],
+                              "peak_rps": peak["rps"],
+                              "peak_conc": peak["conc"],
+                              "peak_p50": peak["p50"],
+                              "sustained_rps": sust["rps"],
+                              "sustained_fail": sust["fail"],
+                              "sustained_p50": sust["p50"],
+                              "sustained_p99": sust["p99"],
+                              "sweep": sweep,
+                          }
+                          all_results.append(entry)
+
+                          # Cool down
+                          await asyncio.sleep(3)
+
+                  # Summary
+                  print(f"\n{'='*60}")
+                  print("SUMMARY — All Configs Compared")
+                  print(f"{'='*60}")
+                  print(f"{'Config':<45} {'Peak RPS':>9} {'Sustained':>10} {'Fail':>5} {'p50':>7}")
+                  print("-" * 80)
+                  for r in all_results:
+                      print(f"{r['config']:<45} {r['peak_rps']:>9.1f} {r['sustained_rps']:>10.1f} {r['sustained_fail']:>5} {r['sustained_p50']:>6.0f}ms")
+
+                  print(f"\nFull results JSON:")
+                  print(json.dumps(all_results, indent=2))
+
+              asyncio.run(main())
+              PYEOF
+
+              python3 /tmp/bench.py
+          env:
+            - name: ASR_SERVER
+              value: "http://zen-asr-server:8000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"

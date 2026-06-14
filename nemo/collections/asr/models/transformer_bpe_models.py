@@ -575,12 +575,6 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
 
     """ Transcription related methods """
 
-    def _transcribe_on_begin(self, audio, trcfg: TranscribeConfig):
-        super()._transcribe_on_begin(audio, trcfg)
-
-        # Freeze the encoder and decoder modules
-        self.transf_decoder.freeze()
-
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         log_probs, encoded_len, enc_states, enc_mask = self.forward(
             input_signal=batch[0], input_signal_length=batch[1]
@@ -633,6 +627,3 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
 
     def _transcribe_on_end(self, trcfg: TranscribeConfig):
         super()._transcribe_on_end(trcfg)
-
-        # Unfreeze the encoder and decoder modules
-        self.transf_decoder.unfreeze(partial=True)

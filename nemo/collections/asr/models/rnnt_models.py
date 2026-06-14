@@ -1000,7 +1000,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             'trim_silence': False,
             'shuffle': False,
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
+            'pin_memory': config.get('pin_memory', True),
         }
 
         if config.get("augmentor"):

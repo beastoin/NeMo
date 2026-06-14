@@ -15,6 +15,8 @@
 import copy
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -581,3 +583,118 @@ class TestTranscriptionMixin:
 
         # Reset the decoding strategy to original
         canary_1b_v2.change_decoding_strategy(orig_decoding_config)
+
+
+class TestTranscriptionThreadSafety:
+    """Tests that transcribe() can be called concurrently without race conditions.
+
+    Regression tests for https://github.com/NVIDIA/NeMo/issues/15771
+    """
+
+    @pytest.mark.unit
+    def test_concurrent_transcribe_no_frozen_grad_map(self, dummy_model):
+        """Verify that concurrent transcribe() calls do not create _frozen_grad_map on submodules."""
+        dummy_model = dummy_model.eval()
+        dummy_model.encoder.weight.data.fill_(1.0)
+        dummy_model.encoder.bias.data.fill_(0.0)
+
+        audio = ['1.0', '2.0']
+        errors = []
+
+        def worker():
+            try:
+                result = dummy_model.transcribe(audio, batch_size=1)
+                assert len(result) == 2
+                return result
+            except Exception as e:
+                errors.append(e)
+                return None
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(worker) for _ in range(8)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert not errors, f"Concurrent transcribe() raised errors: {errors}"
+        assert not hasattr(dummy_model.encoder, '_frozen_grad_map'), (
+            "_frozen_grad_map should not exist after transcribe() — freeze/unfreeze was removed"
+        )
+
+    @pytest.mark.unit
+    def test_concurrent_transcribe_preserves_eval_mode(self, dummy_model):
+        """Verify eval mode is preserved after concurrent transcribe() calls."""
+        dummy_model.eval()
+        audio = ['1.0']
+        barrier = threading.Barrier(4)
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait()
+                dummy_model.transcribe(audio, batch_size=1)
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(worker) for _ in range(4)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert not errors, f"Concurrent transcribe() raised errors: {errors}"
+        assert not dummy_model.training, "Model should remain in eval mode after concurrent transcribe()"
+
+    @pytest.mark.unit
+    def test_concurrent_transcribe_correct_results(self, dummy_model):
+        """Verify all concurrent calls return correct results (no cross-contamination)."""
+        dummy_model = dummy_model.eval()
+        dummy_model.encoder.weight.data.fill_(2.0)
+        dummy_model.encoder.bias.data.fill_(0.0)
+
+        results = {}
+
+        def worker(idx):
+            audio = [str(float(idx))]
+            result = dummy_model.transcribe(audio, batch_size=1)
+            results[idx] = result
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(worker, i) for i in range(1, 9)]
+            for f in as_completed(futures):
+                f.result()
+
+        for idx in range(1, 9):
+            assert idx in results
+            assert len(results[idx]) == 1
+            assert results[idx][0] == pytest.approx(float(idx) * 2.0)
+
+    @pytest.mark.unit
+    def test_transcribe_generator_has_inference_mode(self):
+        """Verify transcribe_generator() is decorated with @torch.inference_mode()."""
+        import inspect
+
+        src = inspect.getsource(TranscriptionMixin.transcribe_generator)
+        assert 'inference_mode' in src, "transcribe_generator() must have @torch.inference_mode() decorator"
+
+    @pytest.mark.unit
+    def test_concurrent_transcribe_generator(self, dummy_model):
+        """Verify transcribe_generator() works concurrently without race conditions."""
+        dummy_model.eval()
+        dummy_model.encoder.weight.data.fill_(1.0)
+        dummy_model.encoder.bias.data.fill_(0.0)
+        errors = []
+
+        def worker():
+            try:
+                gen = dummy_model.transcribe_generator(['1.0', '2.0'], override_config=None)
+                for _ in gen:
+                    pass
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(worker) for _ in range(8)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert not errors, f"Concurrent transcribe_generator() raised errors: {errors}"
+        assert not hasattr(dummy_model.encoder, '_frozen_grad_map')
