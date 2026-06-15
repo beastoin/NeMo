@@ -4,14 +4,16 @@ High-throughput batch transcription server for NVIDIA NeMo Parakeet TDT 0.6B. Dy
 
 ## Performance
 
-| GPU | Sustained RPS | torch.compile | CUDA Graphs | Prefetch | Failures | Cost (spot) | Daily Capacity |
-|-----|:------------:|:-------------:|:-----------:|:--------:|:--------:|:-----------:|:--------------:|
-| **L4** (24GB) | **43** | Yes | Yes | — | 0 | $0.50/hr | 3.7M req |
-| **T4** (16GB) | **6.9** | Yes | No | Yes | 0 | $0.35/hr | 596K req |
+| GPU | Sustained RPS | Realtime Fold | torch.compile | CUDA Graphs | Failures | Cost (spot) | Daily Capacity |
+|-----|:------------:|:-------------:|:-------------:|:-----------:|:--------:|:-----------:|:--------------:|
+| **L4** (24GB) | **43** | **343x** | Yes | Yes | 0 | $0.50/hr | 3.7M req |
+| **T4** (16GB) | **6.9** | **55x** | Yes | No | 0 | $0.35/hr | 596K req |
+
+**343x realtime** means a single L4 GPU transcribes 343 seconds of audio per wall-clock second. One L4 replaces 343 humans transcribing in real time.
 
 L4 is **3.6x more cost-efficient** per request ($0.0032 vs $0.0114 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
 
-All benchmarks: real speech audio (espeak-ng TTS), 0% WER, 0 failures.
+All benchmarks: real speech audio (espeak-ng TTS), 8s clips, 0% WER, 0 failures.
 
 ## Architecture
 
@@ -261,11 +263,11 @@ The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
 ### GPU Selection
 
-| GPU | VRAM | RPS | torch.compile | CUDA Graphs | Prefetch | Spot $/hr | $/1K req | Best For |
-|-----|:----:|:---:|:-------------:|:-----------:|:--------:|:---------:|:--------:|----------|
-| **L4** | 24GB | 43 | Yes | Yes | — | $0.50 | $0.0032 | Production |
-| **T4** | 16GB | 6.9 | Yes | No | Yes | $0.35 | $0.0114 | Dev/staging, low traffic |
-| A100 | 80GB | ~100+ | Yes | Yes | — | $1.50+ | ~$0.004 | Maximum throughput |
+| GPU | VRAM | RPS | Realtime Fold | torch.compile | CUDA Graphs | Spot $/hr | $/1K req | Best For |
+|-----|:----:|:---:|:-------------:|:-------------:|:-----------:|:---------:|:--------:|----------|
+| **L4** | 24GB | 43 | 343x | Yes | Yes | $0.50 | $0.0032 | Production |
+| **T4** | 16GB | 6.9 | 55x | Yes | No | $0.35 | $0.0114 | Dev/staging, low traffic |
+| A100 | 80GB | ~100+ | ~800x | Yes | Yes | $1.50+ | ~$0.004 | Maximum throughput |
 
 ### Deployment Patterns
 
@@ -348,6 +350,34 @@ This server addresses four issues in NeMo's transcription path:
 3. **Cross-thread CUDA tensor GC**: NeMo's RNNT decoder holds CUDA pinned-memory tensors. When GC'd on the async thread instead of the GPU thread, `CachingHostAllocator` segfaults (signal 139). Fixed by serializing results to plain Python dicts on the GPU thread.
 
 4. **Residual generator leak**: NeMo's internal generators can outlive the function return. Fixed by eagerly closing generators and deleting DataLoaders inside `transcribe()`. Automatic GC is disabled (`gc.disable()`) to prevent the async event-loop thread from collecting CUDA tensors. Instead, `gc.collect(0)` runs on the GPU thread after every batch (cheap, scans only young objects), with a full `gc.collect()` every 50 batches.
+
+## Case Study: Omi (AI Wearable)
+
+[Omi](https://github.com/BasedHardware/omi) is an open-source AI wearable that captures conversations and transcribes them in real time. Their backend processes thousands of audio segments from concurrent users.
+
+**Problem**: NeMo's `model.transcribe()` crashed under concurrent requests — CUDA segfaults from cross-thread tensor GC, freeze/unfreeze races, and CUDA Graph incompatibilities. The service was unstable above 2-3 concurrent users.
+
+**Solution**: Deployed this serving stack on GKE with the NGC 26.02 container (PyTorch 2.6 + CUDA 12.8) and the NeMo thread-safety patches from this repo.
+
+**Results** (L4 GPU, torch.compile + CUDA Graphs):
+
+| Metric | Value |
+|--------|-------|
+| Sustained RPS | **35.92** |
+| Realtime fold | **286x** |
+| Total requests tested | 5,134 |
+| Failures | **0** |
+| p50 latency | 1,687ms |
+| p99 latency | 2,734ms |
+| Concurrency tested | up to 128 |
+
+The ~20% gap vs standalone (43 RPS / 343x) is from Omi's application middleware and network path (port-forwarded from GKE). The GPU-side throughput is identical.
+
+**Key deployment choices**:
+- NGC 26.02 base image (PyTorch 2.6 + CUDA 12.8) — PyTorch 2.12+ has a CachingHostAllocator bug that crashes under batched concurrent inference
+- NeMo fork installed with `pip install --no-deps --force-reinstall` to avoid breaking NGC's CUDA-aligned PyTorch
+- All models loaded on the GPU worker thread (not the main thread) to prevent cross-thread CUDA tensor ownership crashes
+- `gc.disable()` at module level + `gc.collect(0)` per batch on GPU thread
 
 ## Known Limitations
 
