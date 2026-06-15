@@ -71,8 +71,8 @@
   <div class="hero-title">Production Numbers (L4 GPU, verified stable)</div>
   <div class="hero-grid">
     <div class="hero-stat"><div class="num">43</div><div class="label">Sustained RPS</div></div>
-    <div class="hero-stat"><div class="num">0</div><div class="label">Failures</div></div>
-    <div class="hero-stat"><div class="num">0%</div><div class="label">WER</div></div>
+    <div class="hero-stat"><div class="num">343x</div><div class="label">Realtime (RTF 0.003)</div></div>
+    <div class="hero-stat"><div class="num">0</div><div class="label">Failures / WER</div></div>
     <div class="hero-stat"><div class="num">$0.003</div><div class="label">per 1K requests</div></div>
   </div>
 </div>
@@ -239,10 +239,12 @@
 <!-- ======== COST & SCALING ======== -->
 <h2>Cost & Scaling</h2>
 <table>
-  <tr><th>GPU</th><th class="c">RPS</th><th class="c">Spot $/hr</th><th class="c">$/1K req</th><th class="c">Daily (1 pod)</th><th class="c">Daily (4 pods)</th></tr>
+  <tr><th>GPU</th><th class="c">RPS</th><th class="c">Realtime</th><th class="c">RTF</th><th class="c">Spot $/hr</th><th class="c">$/1K req</th><th class="c">Daily (1 pod)</th><th class="c">Daily (4 pods)</th></tr>
   <tr class="win">
     <td><strong>L4</strong> (24GB)</td>
     <td class="c"><strong>43</strong></td>
+    <td class="c"><strong>343x</strong></td>
+    <td class="c"><strong>0.003</strong></td>
     <td class="c">$0.50</td>
     <td class="c"><strong>$0.0032</strong></td>
     <td class="c">3.7M</td>
@@ -251,6 +253,8 @@
   <tr>
     <td>T4 (16GB)</td>
     <td class="c">6.9</td>
+    <td class="c">55x</td>
+    <td class="c">0.018</td>
     <td class="c">$0.35</td>
     <td class="c">$0.0114</td>
     <td class="c">596K</td>
@@ -299,6 +303,22 @@
     <td>Architecture, deploy guides, tuning guide, scaling projections</td>
   </tr>
 </table>
+
+<!-- ======== OMI CASE STUDY ======== -->
+<h2>Case Study: Omi (AI Wearable)</h2>
+<p><a href="https://github.com/BasedHardware/omi" style="color:#0969da;text-decoration:none">Omi</a> is an open-source AI wearable that captures conversations and transcribes them in real time. Their backend processes thousands of audio segments from concurrent users. Deployed on GKE with the NGC 26.02 container and these thread-safety patches.</p>
+
+<table>
+  <tr><th>Metric</th><th class="c">Value</th></tr>
+  <tr><td>Sustained RPS</td><td class="c"><strong>35.92</strong></td></tr>
+  <tr><td>Realtime (RTF)</td><td class="c"><strong>286x</strong> (0.003)</td></tr>
+  <tr><td>Total requests tested</td><td class="c">5,134</td></tr>
+  <tr><td>Failures</td><td class="c win"><strong>0</strong></td></tr>
+  <tr><td>p50 / p99 latency</td><td class="c">1,687ms / 2,734ms</td></tr>
+  <tr><td>Max concurrency tested</td><td class="c">128</td></tr>
+</table>
+
+<p>The ~20% gap vs standalone (43 RPS / 343x) is from Omi's application middleware and network path. GPU-side throughput is identical.</p>
 
 <hr>
 

@@ -4,12 +4,12 @@ High-throughput batch transcription server for NVIDIA NeMo Parakeet TDT 0.6B. Dy
 
 ## Performance
 
-| GPU | Sustained RPS | Realtime Fold | torch.compile | CUDA Graphs | Failures | Cost (spot) | Daily Capacity |
-|-----|:------------:|:-------------:|:-------------:|:-----------:|:--------:|:-----------:|:--------------:|
-| **L4** (24GB) | **43** | **343x** | Yes | Yes | 0 | $0.50/hr | 3.7M req |
-| **T4** (16GB) | **6.9** | **55x** | Yes | No | 0 | $0.35/hr | 596K req |
+| GPU | Sustained RPS | Realtime | RTF | torch.compile | CUDA Graphs | Failures | Cost (spot) | Daily Capacity |
+|-----|:------------:|:--------:|:---:|:-------------:|:-----------:|:--------:|:-----------:|:--------------:|
+| **L4** (24GB) | **43** | **343x** | **0.003** | Yes | Yes | 0 | $0.50/hr | 3.7M req |
+| **T4** (16GB) | **6.9** | **55x** | **0.018** | Yes | No | 0 | $0.35/hr | 596K req |
 
-**343x realtime** means a single L4 GPU transcribes 343 seconds of audio per wall-clock second. One L4 replaces 343 humans transcribing in real time.
+**343x realtime** (RTF 0.003) means a single L4 GPU transcribes 343 seconds of audio per wall-clock second — one GPU replaces 343 humans transcribing in real time. RTF (Real-Time Factor) is the inverse: processing time / audio duration, where lower is better and < 1.0 means faster than real time.
 
 L4 is **3.6x more cost-efficient** per request ($0.0032 vs $0.0114 per 1K requests). T4 is viable for low-traffic or budget-constrained deployments.
 
@@ -263,11 +263,11 @@ The included `k8s/hpa.yaml` auto-scales 1-4 replicas based on CPU utilization:
 
 ### GPU Selection
 
-| GPU | VRAM | RPS | Realtime Fold | torch.compile | CUDA Graphs | Spot $/hr | $/1K req | Best For |
-|-----|:----:|:---:|:-------------:|:-------------:|:-----------:|:---------:|:--------:|----------|
-| **L4** | 24GB | 43 | 343x | Yes | Yes | $0.50 | $0.0032 | Production |
-| **T4** | 16GB | 6.9 | 55x | Yes | No | $0.35 | $0.0114 | Dev/staging, low traffic |
-| A100 | 80GB | ~100+ | ~800x | Yes | Yes | $1.50+ | ~$0.004 | Maximum throughput |
+| GPU | VRAM | RPS | Realtime | RTF | torch.compile | CUDA Graphs | Spot $/hr | $/1K req | Best For |
+|-----|:----:|:---:|:--------:|:---:|:-------------:|:-----------:|:---------:|:--------:|----------|
+| **L4** | 24GB | 43 | 343x | 0.003 | Yes | Yes | $0.50 | $0.0032 | Production |
+| **T4** | 16GB | 6.9 | 55x | 0.018 | Yes | No | $0.35 | $0.0114 | Dev/staging, low traffic |
+| A100 | 80GB | ~100+ | ~800x | ~0.001 | Yes | Yes | $1.50+ | ~$0.004 | Maximum throughput |
 
 ### Deployment Patterns
 
@@ -364,7 +364,7 @@ This server addresses four issues in NeMo's transcription path:
 | Metric | Value |
 |--------|-------|
 | Sustained RPS | **35.92** |
-| Realtime fold | **286x** |
+| Realtime | **286x** (RTF 0.003) |
 | Total requests tested | 5,134 |
 | Failures | **0** |
 | p50 latency | 1,687ms |
