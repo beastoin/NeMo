@@ -356,25 +356,28 @@ class GPUWorker:
     def _load_models(self) -> None:
         import nemo.collections.asr as nemo_asr
 
-        device = self._batch_cfg.get("device", "cuda:0")
-        self._pool_size = self._batch_cfg.get("model_pool_size", 1)
-
         torch.backends.cudnn.benchmark = True
         if hasattr(torch, 'set_float32_matmul_precision'):
             torch.set_float32_matmul_precision('high')
         log.info("Torch optimizations: cudnn.benchmark=True, matmul_precision=high")
 
-        if self._pool_size > 1:
-            log.info(f"Loading model pool: {self._pool_size} instances")
-            for i in range(self._pool_size):
-                model = self._load_one_model(nemo_asr, device, i)
-                self._batch_models.append(model)
-                torch.cuda.empty_cache()
-            self._batch_model = self._batch_models[0]
-        else:
-            self._batch_model = self._load_one_model(nemo_asr, device)
+        if self._batch_cfg.get("name"):
+            device = self._batch_cfg.get("device", "cuda:0")
+            self._pool_size = self._batch_cfg.get("model_pool_size", 1)
 
-        torch.cuda.empty_cache()
+            if self._pool_size > 1:
+                log.info(f"Loading model pool: {self._pool_size} instances")
+                for i in range(self._pool_size):
+                    model = self._load_one_model(nemo_asr, device, i)
+                    self._batch_models.append(model)
+                    torch.cuda.empty_cache()
+                self._batch_model = self._batch_models[0]
+            else:
+                self._batch_model = self._load_one_model(nemo_asr, device)
+
+            torch.cuda.empty_cache()
+        else:
+            log.info("No batch model configured, batch transcription will be unavailable")
 
         vram_used = torch.cuda.memory_allocated() / 1024**2
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
@@ -446,6 +449,8 @@ class GPUWorker:
         log.info("Streaming pipeline built and session opened")
 
     def _batch_transcribe(self, payload: dict) -> list:
+        if self._batch_model is None:
+            raise RuntimeError("Batch model not loaded — server started in streaming-only mode")
         return self._batch_transcribe_with_model(self._batch_model, payload)
 
     def _batch_transcribe_with_model(self, model, payload: dict) -> list:

@@ -1,0 +1,25 @@
+# Streaming-only Nemotron ASR config — no batch model loaded.
+# Saves ~4GB VRAM (Parakeet TDT not loaded).
+#
+# Model: nvidia/nemotron-3.5-asr-streaming-0.6b (~1.7GB VRAM)
+# Use case: real-time transcription via WebSocket
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+
+stream_model:
+  name: "nvidia/nemotron-speech-streaming-en-0.6b"
+  device: "cuda:0"
+  compile: false
+  amp: true
+  latency_mode: "480ms"
+  source_language: "English"
+
+stream:
+  max_concurrent_streams: 128
+  chunk_duration_ms: 160
+  sample_rate: 16000
+  max_stream_duration: 1800
+  max_chunk_bytes: 524288

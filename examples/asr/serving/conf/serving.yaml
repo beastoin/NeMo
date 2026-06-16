@@ -13,7 +13,7 @@ batch_model:
   amp: true
 
 stream_model:
-  name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
+  name: "nvidia/nemotron-speech-streaming-en-0.6b"
   device: "cuda:0"
   compile: false
   amp: true
