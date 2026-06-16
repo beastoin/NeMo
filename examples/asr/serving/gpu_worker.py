@@ -384,6 +384,10 @@ class GPUWorker:
         log.info(f"VRAM after model load: {vram_used:.0f}MiB / {vram_total:.0f}MiB")
 
         self._build_stream_pipeline()
+
+        if self._batch_model is None and self._stream_pipeline is None:
+            raise RuntimeError("No models loaded — configure batch_model and/or stream_model")
+
         log.info("Models loaded and ready")
 
     _LATENCY_MODE_TO_CONTEXT = {
@@ -412,8 +416,11 @@ class GPUWorker:
             os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "cache_aware_rnnt.yaml"
         )
         if not os.path.exists(ref_config_path):
-            log.warning(f"Streaming config not found at {ref_config_path}, streaming will be unavailable")
-            return
+            raise FileNotFoundError(
+                f"Streaming config not found at {ref_config_path}. "
+                "Copy examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml "
+                "to the expected path relative to the serving directory."
+            )
 
         base_cfg = OmegaConf.load(ref_config_path)
         overrides = OmegaConf.create({

@@ -117,7 +117,8 @@ def chunk_audio(pcm16_bytes, chunk_duration_ms=160, sample_rate=16000):
 
 
 async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
-                             sample_rate=16000, realtime_pace=True):
+                             sample_rate=16000, realtime_pace=True,
+                             ws_timeout=30):
     """Run one streaming session and collect per-chunk latencies."""
     import websockets
 
@@ -136,8 +137,10 @@ async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
 
     t_session_start = time.monotonic()
     try:
-        async with websockets.connect(f"{ws_url}/v1/stream", max_size=2**20) as ws:
-            open_msg = json.loads(await ws.recv())
+        async with websockets.connect(
+            f"{ws_url}/v1/stream", max_size=2**20, open_timeout=ws_timeout, close_timeout=ws_timeout
+        ) as ws:
+            open_msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=ws_timeout))
             if "error" in open_msg:
                 result["ok"] = False
                 result["error"] = open_msg["error"]
@@ -146,7 +149,7 @@ async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
             for i, chunk in enumerate(chunks):
                 t_chunk_start = time.monotonic()
                 await ws.send(chunk)
-                resp = json.loads(await ws.recv())
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=ws_timeout))
                 chunk_lat = (time.monotonic() - t_chunk_start) * 1000
                 result["chunk_latencies_ms"].append(chunk_lat)
                 result["chunks_sent"] += 1
@@ -162,7 +165,7 @@ async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
                         await asyncio.sleep(expected - elapsed)
 
             await ws.send(json.dumps({"action": "close"}))
-            close_msg = json.loads(await ws.recv())
+            close_msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=ws_timeout))
             result["final_text"] = close_msg.get("final_text", "")
 
     except Exception as exc:
@@ -408,7 +411,7 @@ async def main():
         "benchmark": "NeMo ASR Streaming — Performance Report",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "server": ws_url,
-        "model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+        "model": "nvidia/nemotron-speech-streaming-en-0.6b",
         "chunk_duration_ms": args.chunk_ms,
         "realtime_pace": realtime_pace,
         "audio_samples": len(audio_samples),

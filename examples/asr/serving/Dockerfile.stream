@@ -15,6 +15,7 @@ COPY examples/asr/serving/server.py \
      ./
 
 COPY examples/asr/serving/conf/serving-stream.yaml conf/serving-stream.yaml
+COPY examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml ../conf/asr_streaming_inference/cache_aware_rnnt.yaml
 
 RUN pip install --no-cache-dir \
     "fastapi>=0.115.0" \

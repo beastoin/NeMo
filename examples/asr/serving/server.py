@@ -212,12 +212,21 @@ def _save_upload_sync(src_file, suffix: str, max_bytes: int) -> str:
     return tmp_path
 
 
+def _require_batch_model():
+    if not config.get("batch_model", {}).get("name"):
+        raise HTTPException(
+            status_code=404,
+            detail="Batch transcription not available — server running in streaming-only mode",
+        )
+
+
 @app.post("/v1/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
     timestamps: bool = Query(False, description="Include word-level timestamps"),
 ):
     """Transcribe an audio file using Parakeet TDT with dynamic batching."""
+    _require_batch_model()
     max_bytes = _max_upload_bytes()
     suffix = Path(file.filename).suffix if file.filename else ".wav"
 
@@ -243,6 +252,7 @@ async def transcribe_batch(
     timestamps: bool = Query(False),
 ):
     """Transcribe multiple files. All are batched together for GPU efficiency."""
+    _require_batch_model()
     if len(files) > _MAX_BATCH_FILES:
         raise HTTPException(status_code=400, detail=f"Too many files (max {_MAX_BATCH_FILES})")
 
