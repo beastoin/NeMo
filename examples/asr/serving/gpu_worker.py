@@ -160,29 +160,133 @@ class GPUWorker:
         log.info("GPU worker thread stopped")
 
     def _run_single_mode(self) -> None:
-        log.info("Running in single-model mode")
+        log.info("Running in single-model mode (batched streaming)")
         while self._running:
-            item = None
+            # Drain all pending stream chunks and batch them together
+            stream_items = []
+            non_chunk_item = None
             try:
                 item = self._stream_queue.get_nowait()
+                if item.work_type == WorkType.STREAM_CHUNK:
+                    stream_items.append(item)
+                else:
+                    non_chunk_item = item
             except queue.Empty:
+                pass
+
+            max_batch = self._stream_cfg.get("max_batch_size", 64)
+            while len(stream_items) < max_batch and non_chunk_item is None:
+                try:
+                    item = self._stream_queue.get_nowait()
+                    if item.work_type == WorkType.STREAM_CHUNK:
+                        stream_items.append(item)
+                    else:
+                        non_chunk_item = item
+                        break
+                except queue.Empty:
+                    break
+
+            # Process batched stream chunks
+            if stream_items:
+                self._dispatch_stream_batch(stream_items)
+                self._maybe_gc()
+
+            # Process non-chunk stream items (open/close/shutdown)
+            if non_chunk_item is not None:
+                if non_chunk_item.work_type == WorkType.SHUTDOWN:
+                    break
+                try:
+                    result = self._dispatch(non_chunk_item)
+                    non_chunk_item.loop.call_soon_threadsafe(
+                        self._safe_set_result, non_chunk_item.future, result
+                    )
+                except Exception as exc:
+                    non_chunk_item.loop.call_soon_threadsafe(
+                        self._safe_set_exception, non_chunk_item.future, exc
+                    )
+
+            # If no stream work, check batch queue
+            if not stream_items and non_chunk_item is None:
                 try:
                     item = self._batch_queue.get(timeout=self._batch_poll_timeout)
                 except queue.Empty:
                     continue
-
-            if item.work_type == WorkType.SHUTDOWN:
-                break
-
-            try:
-                result = self._dispatch(item)
-                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
-            except Exception as exc:
-                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
-            finally:
-                self._maybe_gc()
+                if item.work_type == WorkType.SHUTDOWN:
+                    break
+                try:
+                    result = self._dispatch(item)
+                    item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+                except Exception as exc:
+                    item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                finally:
+                    self._maybe_gc()
 
         self._drain_queues([self._stream_queue, self._batch_queue])
+
+    @torch.inference_mode()
+    def _dispatch_stream_batch(self, items: list) -> None:
+        """Process multiple stream chunks in a single batched GPU call."""
+        from nemo.collections.asr.inference.streaming.framing.request import Frame
+        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+
+        frames = []
+        valid_items = []
+        for item in items:
+            payload = item.payload
+            stream_id = payload["stream_id"]
+            audio_chunk = payload["audio_chunk"]
+            session = self._stream_sessions.get(stream_id)
+            if session is None:
+                item.loop.call_soon_threadsafe(
+                    self._safe_set_exception, item.future,
+                    ValueError(f"Unknown stream: {stream_id}")
+                )
+                continue
+
+            chunk_index = session["chunk_index"]
+            is_first = chunk_index == 0
+            session["chunk_index"] = chunk_index + 1
+
+            samples = torch.tensor(audio_chunk, dtype=torch.float32)
+            options = (
+                ASRRequestOptions(
+                    enable_itn=False, enable_nmt=False,
+                    source_language=self._source_language,
+                )
+                if is_first else None
+            )
+            frames.append(Frame(
+                samples=samples, stream_id=session["int_id"],
+                is_first=is_first, is_last=False, options=options,
+            ))
+            valid_items.append(item)
+
+        if not frames:
+            return
+
+        if len(frames) > 1:
+            log.debug(f"Batched {len(frames)} stream chunks")
+
+        outputs = self._stream_pipeline.transcribe_step(frames)
+
+        for i, item in enumerate(valid_items):
+            stream_id = item.payload["stream_id"]
+            if i < len(outputs) and outputs[i] is not None:
+                output = outputs[i]
+                result = {
+                    "stream_id": stream_id,
+                    "partial_transcript": getattr(output, 'partial_transcript', '') or '',
+                    "final_transcript": getattr(output, 'final_transcript', '') or '',
+                    "is_final": bool(getattr(output, 'final_transcript', '')),
+                }
+            else:
+                result = {
+                    "stream_id": stream_id,
+                    "partial_transcript": "",
+                    "final_transcript": "",
+                    "is_final": False,
+                }
+            item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
 
     def _run_pool_mode(self) -> None:
         log.info(f"Running in pool mode: {self._pool_size} model workers")
