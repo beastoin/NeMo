@@ -267,17 +267,22 @@ class GPUWorker:
         if len(frames) > 1:
             log.debug(f"Batched {len(frames)} stream chunks")
 
-        outputs = self._stream_pipeline.transcribe_step(frames)
+        self._stream_pipeline.transcribe_step(frames)
 
-        for i, item in enumerate(valid_items):
+        for item in valid_items:
             stream_id = item.payload["stream_id"]
-            if i < len(outputs) and outputs[i] is not None:
-                output = outputs[i]
+            session = self._stream_sessions.get(stream_id)
+            int_id = session["int_id"] if session else None
+            state = self._stream_pipeline.get_state(int_id) if int_id is not None else None
+            if state is not None:
+                final = getattr(state, 'final_transcript', '') or ''
+                if final and session is not None:
+                    session["committed_text"] += " " + final
                 result = {
                     "stream_id": stream_id,
-                    "partial_transcript": getattr(output, 'partial_transcript', '') or '',
-                    "final_transcript": getattr(output, 'final_transcript', '') or '',
-                    "is_final": bool(getattr(output, 'final_transcript', '')),
+                    "partial_transcript": getattr(state, 'partial_transcript', '') or '',
+                    "final_transcript": final,
+                    "is_final": bool(final),
                 }
             else:
                 result = {
@@ -618,6 +623,7 @@ class GPUWorker:
             "int_id": stream_int_id,
             "chunk_index": 0,
             "created_at": time.monotonic(),
+            "committed_text": "",
         }
         return {"stream_id": stream_id, "status": "opened"}
 
@@ -655,14 +661,16 @@ class GPUWorker:
             options=options,
         )
 
-        outputs = self._stream_pipeline.transcribe_step([frame])
-        output = outputs[0] if outputs else None
+        self._stream_pipeline.transcribe_step([frame])
+        state = self._stream_pipeline.get_state(session["int_id"])
 
         partial = ""
         final = ""
-        if output is not None:
-            partial = getattr(output, 'partial_transcript', '') or ''
-            final = getattr(output, 'final_transcript', '') or ''
+        if state is not None:
+            partial = getattr(state, 'partial_transcript', '') or ''
+            final = getattr(state, 'final_transcript', '') or ''
+            if final:
+                session["committed_text"] += " " + final
 
         return {
             "stream_id": stream_id,
@@ -678,9 +686,8 @@ class GPUWorker:
         if session is None:
             return {"stream_id": stream_id, "status": "not_found"}
 
-        final_text = ""
+        final_text = session.get("committed_text", "").strip()
 
-        # Only send final frame if chunks were actually processed
         if session["chunk_index"] > 0:
             from nemo.collections.asr.inference.streaming.framing.request import Frame
             from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
@@ -692,10 +699,15 @@ class GPUWorker:
                 is_last=True,
                 options=ASRRequestOptions(enable_itn=False, enable_nmt=False),
             )
-            outputs = self._stream_pipeline.transcribe_step([frame])
-            output = outputs[0] if outputs else None
-            if output is not None:
-                final_text = getattr(output, 'final_transcript', '') or ''
+            self._stream_pipeline.transcribe_step([frame])
+            state = self._stream_pipeline.get_state(session["int_id"])
+            if state is not None:
+                remaining_final = getattr(state, 'final_transcript', '') or ''
+                remaining_partial = getattr(state, 'partial_transcript', '') or ''
+                if remaining_final:
+                    final_text = (final_text + " " + remaining_final).strip()
+                elif remaining_partial and not final_text:
+                    final_text = remaining_partial.strip()
 
             self._stream_pipeline.delete_state(session["int_id"])
 
