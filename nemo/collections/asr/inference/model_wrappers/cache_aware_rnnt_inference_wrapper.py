@@ -134,6 +134,14 @@ class CacheAwareRNNTInferenceWrapper(CacheAwareASRInferenceWrapper):
             encoded = encoded[:, :, :valid_out_len]
             encoded_len = torch.ones_like(encoded_len) * valid_out_len
 
+        if prompt_vectors is not None and getattr(self.asr_model, 'concat', False):
+            encoded = encoded.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+            time_steps = encoded.shape[1]
+            prompt = prompt_vectors.unsqueeze(1).expand(-1, time_steps, -1).to(encoded.dtype)
+            out_dtype = encoded.dtype
+            encoded = self.asr_model.prompt_kernel(torch.cat([encoded, prompt], dim=-1)).to(out_dtype)
+            encoded = encoded.transpose(1, 2)  # (B, T, D) -> (B, D, T)
+
         best_hyp = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
             encoded, encoded_len, return_hypotheses=True, partial_hypotheses=previous_hypotheses
         )

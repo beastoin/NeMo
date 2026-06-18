@@ -1,7 +1,7 @@
 # Streaming-only Nemotron ASR config — no batch model loaded.
 # Saves ~8GB VRAM (Parakeet TDT not loaded).
 #
-# Model: nvidia/nemotron-speech-streaming-en-0.6b (~5.7GB VRAM on L4, English)
+# Model: nvidia/nemotron-3.5-asr-streaming-0.6b (~5.7GB VRAM on L4, multilingual)
 # Use case: real-time transcription via WebSocket
 
 server:
@@ -10,7 +10,7 @@ server:
   workers: 1
 
 stream_model:
-  name: "nvidia/nemotron-speech-streaming-en-0.6b"
+  name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
   device: "cuda:0"
   compile: false
   amp: true

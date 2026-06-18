@@ -499,11 +499,11 @@ class GPUWorker:
 
         log.info("Models loaded and ready")
 
-    _LATENCY_MODE_TO_CONTEXT = {
-        "80ms": [70, 0],
-        "160ms": [70, 1],
-        "480ms": [70, 6],
-        "1040ms": [70, 13],
+    _LATENCY_MODE_TO_RIGHT_CONTEXT = {
+        "80ms": 0,
+        "160ms": 1,
+        "480ms": 6,
+        "1040ms": 13,
     }
 
     def _build_stream_pipeline(self) -> None:
@@ -544,19 +544,23 @@ class GPUWorker:
             "enable_nmt": False,
         })
 
-        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
-        context = self._LATENCY_MODE_TO_CONTEXT.get(latency_mode)
-        if context is not None:
-            overrides["streaming"] = {"att_context_size": context}
-            log.info(f"Streaming latency mode: {latency_mode} (att_context_size={context})")
-
         source_lang = self._stream_cfg.get("source_language", "English")
         overrides["source_language"] = source_lang
         self._source_language = source_lang
 
+        overrides["streaming"] = {"att_context_size": None}
         cfg = OmegaConf.merge(base_cfg, overrides)
 
         self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)
+
+        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
+        right_ctx = self._LATENCY_MODE_TO_RIGHT_CONTEXT.get(latency_mode)
+        if right_ctx is not None:
+            left_ctx = self._stream_pipeline.asr_model.get_att_context_size()[0]
+            att_context = [left_ctx, right_ctx]
+            self._stream_pipeline.asr_model.set_default_att_context_size(att_context)
+            log.info(f"Streaming latency mode: {latency_mode} (att_context_size={att_context})")
+
         # Initialize the session once — per-stream state is managed via
         # init_state() (called by transcribe_step when is_first=True) and
         # delete_state(). Do NOT call open_session() per stream — it resets
