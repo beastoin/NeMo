@@ -29,6 +29,33 @@ Deploy either mode independently or both together. Production-tested with [Omi](
 
 All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CUDA 12.8), zero failures.
 
+### Feature Matrix
+
+| Feature | Batch | Streaming | Notes |
+|---------|:-----:|:---------:|-------|
+| Transcription | **Yes** | **Yes** | |
+| Word timestamps | **Yes** | No | `?timestamps=true` on REST API |
+| Partial transcripts | N/A | **Yes** | Per-chunk partial + final |
+| Punctuation & capitalization | **Yes** | **Yes** | Built into model output |
+| Multilingual | No | **Yes** | Prompt-conditioned language selection |
+| ITN (inverse text normalization) | No | No | Supported by models, not yet exposed |
+| Diarization | No | No | Requires separate model (e.g. pyannote) |
+| Confidence scores | No | No | |
+| VAD | No | No | |
+
+### Performance at a Glance (L4 GPU)
+
+| Metric | Batch | Streaming |
+|--------|:-----:|:---------:|
+| WER (LibriSpeech) | ~3-5% | 6.9% |
+| RTFx | 343x | N/A (realtime-paced) |
+| RTF | 0.003 | N/A |
+| Max throughput | 43 RPS | c=56 (129 sess/min) |
+| p99 latency | ~2.7s | 2.8s |
+| VRAM | ~4 GB | ~5.7 GB |
+| torch.compile | Yes (+20-30%) | No benefit |
+| Zero failures | Yes | Yes |
+
 ## Architecture
 
 ```
