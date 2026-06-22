@@ -422,7 +422,8 @@ stream:
   max_concurrent_streams: 128   # Max simultaneous WebSocket sessions
   chunk_duration_ms: 160        # Client-side chunk size hint
   sample_rate: 16000            # Expected audio sample rate
-  max_stream_duration: 1800     # Auto-close after 30 minutes
+  max_stream_duration: 0        # 0 = unlimited (no hard cap on stream length)
+  idle_timeout: 300             # Close streams silent for 5 min (zombie protection)
   max_chunk_bytes: 524288       # 512KB max per WebSocket frame
 ```
 
@@ -668,5 +669,5 @@ This server addresses five issues in NeMo's inference path that cause crashes un
 - **T4 requires `cuda_graphs: false`** for batch mode. CUDA Graph conditional nodes in the RNNT decoder crash on Turing architecture. Throughput impact is minor (~5%).
 - **torch.compile warmup.** First batch inference takes ~60s for kernel compilation. K8s `startupProbe` handles this gracefully.
 - **workers=1 required.** GPU models are not fork-safe. Do not set `workers > 1`.
-- **Stream duration limit.** Streams auto-close after 30 minutes (`max_stream_duration`). Clients should reconnect for longer sessions.
+- **Idle stream reaping.** Streams that stop sending audio are closed after `idle_timeout` (default 5 min). Set `max_stream_duration` > 0 to also enforce a hard time cap.
 - **No TLS/auth built in.** Deploy behind a reverse proxy (Nginx, Envoy, GKE Ingress) for TLS termination and authentication.

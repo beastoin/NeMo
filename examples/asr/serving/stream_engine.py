@@ -49,6 +49,7 @@ log = logging.getLogger(__name__)
 class StreamSession:
     stream_id: str
     created_at: float = field(default_factory=time.monotonic)
+    last_chunk_at: float = field(default_factory=time.monotonic)
     chunks_processed: int = 0
     total_audio_seconds: float = 0.0
 
@@ -62,7 +63,8 @@ class StreamEngine:
         max_concurrent_streams: int = 128,
         chunk_duration_ms: int = 160,
         sample_rate: int = 16000,
-        max_stream_duration: int = 1800,
+        max_stream_duration: int = 0,
+        idle_timeout: int = 300,
         max_chunk_bytes: int = 512 * 1024,
     ):
         self._gpu_worker = gpu_worker
@@ -70,25 +72,54 @@ class StreamEngine:
         self._chunk_duration_ms = chunk_duration_ms
         self._sample_rate = sample_rate
         self._max_stream_duration = max_stream_duration
+        self._idle_timeout = idle_timeout
         self._max_chunk_bytes = max_chunk_bytes
         self._sessions: dict[str, StreamSession] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._reaper_task: Optional[asyncio.Task] = None
         self._metrics = {
             "total_streams_opened": 0,
             "total_streams_closed": 0,
             "total_chunks_processed": 0,
+            "total_streams_reaped": 0,
         }
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        if self._idle_timeout > 0:
+            self._reaper_task = asyncio.create_task(self._reap_idle_streams())
 
     async def stop(self) -> None:
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
         stream_ids = list(self._sessions.keys())
         for sid in stream_ids:
             try:
                 await self.close_stream(sid)
             except Exception as exc:
                 log.warning(f"Error closing stream {sid} during shutdown: {exc}")
+
+    async def _reap_idle_streams(self) -> None:
+        """Periodically close streams that stopped sending audio."""
+        while True:
+            await asyncio.sleep(30)
+            now = time.monotonic()
+            to_reap = []
+            for sid, session in self._sessions.items():
+                idle = now - session.last_chunk_at
+                if idle > self._idle_timeout:
+                    to_reap.append(sid)
+            for sid in to_reap:
+                log.warning(f"Reaping idle stream {sid} (idle {self._idle_timeout}s)")
+                try:
+                    await self.close_stream(sid)
+                    self._metrics["total_streams_reaped"] += 1
+                except Exception as exc:
+                    log.error(f"Failed to reap stream {sid}: {exc}")
 
     async def open_stream(self) -> dict:
         """Open a new streaming session. Returns stream_id."""
@@ -123,10 +154,15 @@ class StreamEngine:
         if session is None:
             raise ValueError(f"Unknown stream: {stream_id}")
 
-        elapsed = time.monotonic() - session.created_at
-        if elapsed > self._max_stream_duration:
-            await self.close_stream(stream_id)
-            raise StreamExpiredError(f"Stream {stream_id} exceeded max duration {self._max_stream_duration}s")
+        now = time.monotonic()
+
+        if self._max_stream_duration > 0:
+            elapsed = now - session.created_at
+            if elapsed > self._max_stream_duration:
+                await self.close_stream(stream_id)
+                raise StreamExpiredError(f"Stream {stream_id} exceeded max duration {self._max_stream_duration}s")
+
+        session.last_chunk_at = now
 
         import numpy as np
 

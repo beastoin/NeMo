@@ -108,7 +108,8 @@ async def lifespan(app: FastAPI):
         max_concurrent_streams=stream_cfg.get("max_concurrent_streams", 128),
         chunk_duration_ms=stream_cfg.get("chunk_duration_ms", 160),
         sample_rate=stream_cfg.get("sample_rate", 16000),
-        max_stream_duration=stream_cfg.get("max_stream_duration", 1800),
+        max_stream_duration=stream_cfg.get("max_stream_duration", 0),
+        idle_timeout=stream_cfg.get("idle_timeout", 300),
         max_chunk_bytes=stream_cfg.get("max_chunk_bytes", 512 * 1024),
     )
     await stream_engine.start()

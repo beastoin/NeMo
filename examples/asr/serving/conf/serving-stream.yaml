@@ -21,5 +21,6 @@ stream:
   max_concurrent_streams: 128
   chunk_duration_ms: 160
   sample_rate: 16000
-  max_stream_duration: 1800
+  max_stream_duration: 0        # 0 = unlimited (no hard cap on stream length)
+  idle_timeout: 300              # close streams silent for 5 minutes (zombie protection)
   max_chunk_bytes: 524288
