@@ -307,11 +307,14 @@ class GPUWorker:
                 state = self._stream_pipeline.get_state(int_id)
                 if state is not None:
                     final = getattr(state, 'final_transcript', '') or ''
+                    partial = getattr(state, 'partial_transcript', '') or ''
                     if final:
                         session["committed_text"] += " " + final
+                    if partial:
+                        session["last_partial"] = partial
                     result = {
                         "stream_id": stream_id,
-                        "partial_transcript": getattr(state, 'partial_transcript', '') or '',
+                        "partial_transcript": partial,
                         "final_transcript": final,
                         "is_final": bool(final),
                     }
@@ -679,6 +682,7 @@ class GPUWorker:
             "chunk_index": 0,
             "created_at": time.monotonic(),
             "committed_text": "",
+            "last_partial": "",
             "audio_buffer": bytearray(),
             "buffer_samples": 0,
             "frames_sent": 0,
@@ -743,6 +747,8 @@ class GPUWorker:
                 final = getattr(state, 'final_transcript', '') or ''
                 if final:
                     session["committed_text"] += " " + final
+                if partial:
+                    session["last_partial"] = partial
 
         return {
             "stream_id": stream_id,
@@ -762,6 +768,7 @@ class GPUWorker:
             return {"stream_id": stream_id, "status": "not_found"}
 
         final_text = session.get("committed_text", "").strip()
+        last_partial = session.get("last_partial", "").strip()
 
         # Flush any remaining buffered audio
         if session["buffer_samples"] > 0:
@@ -806,6 +813,9 @@ class GPUWorker:
                     final_text = remaining_partial.strip()
 
             self._stream_pipeline.delete_state(session["int_id"])
+
+        if not final_text and last_partial:
+            final_text = last_partial
 
         return {
             "stream_id": stream_id,
