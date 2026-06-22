@@ -12,6 +12,7 @@ batch_model:
   device: "cuda:0"
   compile: true
   amp: true
+  cuda_graphs: false  # T4/Turing crashes with RNNT CUDA graph conditional nodes
 
 batcher:
   max_batch_size: 32

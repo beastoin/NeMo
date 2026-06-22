@@ -25,12 +25,10 @@ COPY examples/asr/serving/conf/serving-stream.yaml conf/serving-stream.yaml
 COPY examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml \
      ../conf/asr_streaming_inference/cache_aware_rnnt.yaml
 
-# Replace NeMo source with our fork (prompt model class + thread-safety patches).
-# The base image has NeMo editable-installed at /opt/NeMo/ which takes sys.path
-# precedence over pip site-packages. Replace the source tree in-place.
-RUN rm -rf /opt/NeMo \
-    && git clone --depth 1 -b feat/nemotron-streaming-serving \
-       https://github.com/beastoin/NeMo.git /opt/NeMo
+# Replace NeMo source with the checked-out repo (prompt model class + thread-safety
+# patches). The base image has NeMo editable-installed at /opt/NeMo/ which takes
+# sys.path precedence over pip site-packages — copy our source tree over it.
+COPY nemo/ /opt/NeMo/nemo/
 
 # Install serving + benchmark dependencies
 RUN pip install --no-cache-dir \

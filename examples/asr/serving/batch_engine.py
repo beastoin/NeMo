@@ -154,7 +154,10 @@ class BatchEngine:
     def _serialize_result(result: Any, audio_path: str, timestamps: bool) -> dict:
         """Convert a NeMo transcription result to a JSON-serializable dict."""
         output = {"audio_path": audio_path}
-        if hasattr(result, 'text'):
+        if isinstance(result, dict) and "text" in result:
+            output.update(result)
+            return output
+        elif hasattr(result, 'text'):
             output["text"] = result.text
         else:
             output["text"] = str(result)
