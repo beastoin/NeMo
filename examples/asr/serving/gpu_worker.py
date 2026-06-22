@@ -241,6 +241,10 @@ class GPUWorker:
         frame_stream_ids: set[str] = set()
         valid_items = []
 
+        import numpy as np
+
+        chunk_bytes = self._stream_chunk_samples * 4
+
         for item in items:
             payload = item.payload
             stream_id = payload["stream_id"]
@@ -254,19 +258,25 @@ class GPUWorker:
                 continue
 
             session["chunk_index"] += 1
-            session["audio_buffer"].extend(audio_chunk)
+            session["audio_buffer"].extend(audio_chunk.astype(np.float32).tobytes())
             session["buffer_samples"] += len(audio_chunk)
+
+            if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
+                excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
+                session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+                session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
+
             valid_items.append(item)
 
-            if session["buffer_samples"] >= self._stream_chunk_samples:
-                chunk_data = session["audio_buffer"][:self._stream_chunk_samples]
-                session["audio_buffer"] = session["audio_buffer"][self._stream_chunk_samples:]
+            while session["buffer_samples"] >= self._stream_chunk_samples:
+                raw = bytes(session["audio_buffer"][:chunk_bytes])
+                session["audio_buffer"] = session["audio_buffer"][chunk_bytes:]
                 session["buffer_samples"] -= self._stream_chunk_samples
 
                 is_first = session["frames_sent"] == 0
                 session["frames_sent"] += 1
 
-                samples = torch.tensor(chunk_data, dtype=torch.float32)
+                samples = torch.frombuffer(raw, dtype=torch.float32).clone()
                 options = (
                     ASRRequestOptions(
                         enable_itn=False, enable_nmt=False,
@@ -654,6 +664,8 @@ class GPUWorker:
                 out.append(str(r))
         return out
 
+    _MAX_BUFFER_SAMPLES = 5120 * 10
+
     def _stream_open(self, payload: dict) -> dict:
         if self._stream_pipeline is None:
             raise RuntimeError("Streaming pipeline not available")
@@ -667,7 +679,7 @@ class GPUWorker:
             "chunk_index": 0,
             "created_at": time.monotonic(),
             "committed_text": "",
-            "audio_buffer": [],
+            "audio_buffer": bytearray(),
             "buffer_samples": 0,
             "frames_sent": 0,
         }
@@ -676,6 +688,7 @@ class GPUWorker:
     def _stream_chunk(self, payload: dict) -> dict:
         from nemo.collections.asr.inference.streaming.framing.request import Frame
         from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+        import numpy as np
 
         stream_id = payload["stream_id"]
         audio_chunk = payload["audio_chunk"]
@@ -685,18 +698,27 @@ class GPUWorker:
             raise ValueError(f"Unknown stream: {stream_id}")
 
         session["chunk_index"] += 1
-        session["audio_buffer"].extend(audio_chunk)
+        session["audio_buffer"].extend(audio_chunk.astype(np.float32).tobytes())
         session["buffer_samples"] += len(audio_chunk)
 
-        if session["buffer_samples"] >= self._stream_chunk_samples:
-            chunk_data = session["audio_buffer"][:self._stream_chunk_samples]
-            session["audio_buffer"] = session["audio_buffer"][self._stream_chunk_samples:]
+        if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
+            excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
+            session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+            session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
+
+        partial = ""
+        final = ""
+        chunk_bytes = self._stream_chunk_samples * 4
+
+        while session["buffer_samples"] >= self._stream_chunk_samples:
+            raw = bytes(session["audio_buffer"][:chunk_bytes])
+            session["audio_buffer"] = session["audio_buffer"][chunk_bytes:]
             session["buffer_samples"] -= self._stream_chunk_samples
 
             is_first = session["frames_sent"] == 0
             session["frames_sent"] += 1
 
-            samples = torch.tensor(chunk_data, dtype=torch.float32)
+            samples = torch.frombuffer(raw, dtype=torch.float32).clone()
             options = (
                 ASRRequestOptions(
                     enable_itn=False,
@@ -716,26 +738,17 @@ class GPUWorker:
             self._stream_pipeline.transcribe_step([frame])
             state = self._stream_pipeline.get_state(session["int_id"])
 
-            partial = ""
-            final = ""
             if state is not None:
                 partial = getattr(state, 'partial_transcript', '') or ''
                 final = getattr(state, 'final_transcript', '') or ''
                 if final:
                     session["committed_text"] += " " + final
 
-            return {
-                "stream_id": stream_id,
-                "partial_transcript": partial,
-                "final_transcript": final,
-                "is_final": bool(final),
-            }
-
         return {
             "stream_id": stream_id,
-            "partial_transcript": "",
-            "final_transcript": "",
-            "is_final": False,
+            "partial_transcript": partial,
+            "final_transcript": final,
+            "is_final": bool(final),
         }
 
     def _stream_close(self, payload: dict) -> dict:
@@ -752,9 +765,9 @@ class GPUWorker:
 
         # Flush any remaining buffered audio
         if session["buffer_samples"] > 0:
-            remaining = session["audio_buffer"][:session["buffer_samples"]]
+            raw = bytes(session["audio_buffer"][:session["buffer_samples"] * 4])
             is_first = session["frames_sent"] == 0
-            samples = torch.tensor(remaining, dtype=torch.float32)
+            samples = torch.frombuffer(raw, dtype=torch.float32).clone()
             options = (
                 ASRRequestOptions(
                     enable_itn=False, enable_nmt=False,

@@ -327,6 +327,10 @@ async def stream_ws(websocket: WebSocket):
         await websocket.send_json({"error": "Too many active streams"})
         await websocket.close(code=1013)
         return
+    except Exception as exc:
+        await websocket.send_json({"error": str(exc)})
+        await websocket.close(code=1011)
+        return
 
     try:
         while True:
@@ -336,7 +340,11 @@ async def stream_ws(websocket: WebSocket):
                 break
 
             if "bytes" in message:
-                result = await stream_engine.process_chunk(stream_id, message["bytes"])
+                try:
+                    result = await stream_engine.process_chunk(stream_id, message["bytes"])
+                except ValueError:
+                    await websocket.send_json({"error": "Stream closed by server (idle timeout)"})
+                    break
                 await websocket.send_json(result)
 
             elif "text" in message:
@@ -350,7 +358,10 @@ async def stream_ws(websocket: WebSocket):
         await websocket.send_json({"error": str(exc)})
     except Exception as exc:
         log.error(f"Stream {stream_id} error: {exc}")
-        await websocket.send_json({"error": str(exc)})
+        try:
+            await websocket.send_json({"error": str(exc)})
+        except Exception:
+            pass
     finally:
         final = await stream_engine.close_stream(stream_id)
         try:
