@@ -25,6 +25,12 @@ COPY examples/asr/serving/conf/serving-stream.yaml conf/serving-stream.yaml
 COPY examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml \
      ../conf/asr_streaming_inference/cache_aware_rnnt.yaml
 
+# Install NeMo fork with prompt model class + thread-safety patches.
+# The 26.02 base image predates nemotron-3.5-asr-streaming — our fork adds
+# rnnt_bpe_models_prompt and fixes pinned-memory cross-thread GC.
+RUN pip install --no-cache-dir --no-deps --force-reinstall \
+    "nemo_toolkit[asr] @ git+https://github.com/beastoin/NeMo.git@feat/nemotron-streaming-serving"
+
 # Install serving + benchmark dependencies
 RUN pip install --no-cache-dir \
     "fastapi>=0.115.0" \
