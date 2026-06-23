@@ -1,0 +1,55 @@
+# Streaming-only Nemotron ASR server.
+# Uses NeMo NGC base for streaming pipeline (cache-aware RNNT).
+#
+# Model: nvidia/nemotron-speech-streaming-en-0.6b (~5.7GB VRAM on L4)
+# Use case: real-time transcription via WebSocket (/v1/stream)
+#
+# Build:  docker build -f examples/asr/serving/Dockerfile.stream -t nemotron-stream .
+# Run:    docker run --gpus all -p 8000:8000 nemotron-stream
+# Bench:  docker exec <id> python stream_benchmark.py --server ws://localhost:8000
+
+FROM nvcr.io/nvidia/nemo:26.02
+
+WORKDIR /app/serving
+
+# Copy serving code (batch_engine needed for unconditional import in server.py)
+COPY examples/asr/serving/server.py \
+     examples/asr/serving/gpu_worker.py \
+     examples/asr/serving/batch_engine.py \
+     examples/asr/serving/stream_engine.py \
+     examples/asr/serving/stream_benchmark.py \
+     ./
+
+# Copy configs
+COPY examples/asr/serving/conf/serving-stream.yaml conf/serving-stream.yaml
+COPY examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml \
+     ../conf/asr_streaming_inference/cache_aware_rnnt.yaml
+
+# Replace NeMo source with the checked-out repo (prompt model class + thread-safety
+# patches). The base image has NeMo editable-installed at /opt/NeMo/ which takes
+# sys.path precedence over pip site-packages — copy our source tree over it.
+COPY nemo/ /opt/NeMo/nemo/
+
+# Install serving + benchmark dependencies
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.30.0" \
+    "python-multipart>=0.0.6" \
+    "pyyaml>=6.0" \
+    "websockets>=12.0" \
+    "aiohttp>=3.9.0" \
+    "numpy>=1.24.0" \
+    && apt-get update && apt-get install -y --no-install-recommends espeak-ng \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV HF_HOME=/app/.cache/huggingface
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=180s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["python", "server.py", "--config", "conf/serving-stream.yaml", "--host", "0.0.0.0", "--port", "8000"]

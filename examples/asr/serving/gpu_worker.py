@@ -74,6 +74,7 @@ class GPUWorker:
         self._stream_sessions: dict[str, dict] = {}
         self._next_stream_int_id = 1
         self._source_language = "English"
+        self._stream_chunk_samples = 5120
         self._batch_poll_timeout = 0.05
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
@@ -160,29 +161,178 @@ class GPUWorker:
         log.info("GPU worker thread stopped")
 
     def _run_single_mode(self) -> None:
-        log.info("Running in single-model mode")
+        log.info("Running in single-model mode (batched streaming)")
         while self._running:
-            item = None
+            # Drain all pending stream chunks and batch them together
+            stream_items = []
+            non_chunk_item = None
             try:
                 item = self._stream_queue.get_nowait()
+                if item.work_type == WorkType.STREAM_CHUNK:
+                    stream_items.append(item)
+                else:
+                    non_chunk_item = item
             except queue.Empty:
+                pass
+
+            max_batch = self._stream_cfg.get("max_batch_size", 64)
+            while len(stream_items) < max_batch and non_chunk_item is None:
+                try:
+                    item = self._stream_queue.get_nowait()
+                    if item.work_type == WorkType.STREAM_CHUNK:
+                        stream_items.append(item)
+                    else:
+                        non_chunk_item = item
+                        break
+                except queue.Empty:
+                    break
+
+            # Process batched stream chunks
+            if stream_items:
+                self._dispatch_stream_batch(stream_items)
+                self._maybe_gc()
+
+            # Process non-chunk stream items (open/close/shutdown)
+            if non_chunk_item is not None:
+                if non_chunk_item.work_type == WorkType.SHUTDOWN:
+                    break
+                try:
+                    result = self._dispatch(non_chunk_item)
+                    non_chunk_item.loop.call_soon_threadsafe(
+                        self._safe_set_result, non_chunk_item.future, result
+                    )
+                except Exception as exc:
+                    non_chunk_item.loop.call_soon_threadsafe(
+                        self._safe_set_exception, non_chunk_item.future, exc
+                    )
+
+            # If no stream work, check batch queue
+            if not stream_items and non_chunk_item is None:
                 try:
                     item = self._batch_queue.get(timeout=self._batch_poll_timeout)
                 except queue.Empty:
                     continue
-
-            if item.work_type == WorkType.SHUTDOWN:
-                break
-
-            try:
-                result = self._dispatch(item)
-                item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
-            except Exception as exc:
-                item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
-            finally:
-                self._maybe_gc()
+                if item.work_type == WorkType.SHUTDOWN:
+                    break
+                try:
+                    result = self._dispatch(item)
+                    item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+                except Exception as exc:
+                    item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                finally:
+                    self._maybe_gc()
 
         self._drain_queues([self._stream_queue, self._batch_queue])
+
+    @torch.inference_mode()
+    def _dispatch_stream_batch(self, items: list) -> None:
+        """Process multiple stream chunks in a single batched GPU call.
+
+        Small WebSocket chunks (e.g. 40ms / 640 samples) are accumulated per
+        stream until the pipeline's native chunk size is reached (typically
+        320ms / 5120 samples).  This matches the chunk size used by
+        ``pipeline.run()`` and is required for prompt-conditioned multilingual
+        models to produce non-blank output.
+        """
+        from nemo.collections.asr.inference.streaming.framing.request import Frame
+        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+
+        frames = []
+        frame_stream_ids: set[str] = set()
+        valid_items = []
+
+        import numpy as np
+
+        chunk_bytes = self._stream_chunk_samples * 4
+
+        for item in items:
+            payload = item.payload
+            stream_id = payload["stream_id"]
+            audio_chunk = payload["audio_chunk"]
+            session = self._stream_sessions.get(stream_id)
+            if session is None:
+                item.loop.call_soon_threadsafe(
+                    self._safe_set_exception, item.future,
+                    ValueError(f"Unknown stream: {stream_id}")
+                )
+                continue
+
+            session["chunk_index"] += 1
+            session["audio_buffer"].extend(audio_chunk.astype(np.float32).tobytes())
+            session["buffer_samples"] += len(audio_chunk)
+
+            if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
+                excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
+                session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+                session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
+
+            valid_items.append(item)
+
+            while session["buffer_samples"] >= self._stream_chunk_samples:
+                raw = bytes(session["audio_buffer"][:chunk_bytes])
+                session["audio_buffer"] = session["audio_buffer"][chunk_bytes:]
+                session["buffer_samples"] -= self._stream_chunk_samples
+
+                is_first = session["frames_sent"] == 0
+                session["frames_sent"] += 1
+
+                samples = torch.frombuffer(raw, dtype=torch.float32).clone()
+                options = (
+                    ASRRequestOptions(
+                        enable_itn=False, enable_nmt=False,
+                        source_language=self._source_language,
+                    )
+                    if is_first else None
+                )
+                frames.append(Frame(
+                    samples=samples, stream_id=session["int_id"],
+                    is_first=is_first, is_last=False, options=options,
+                ))
+                frame_stream_ids.add(stream_id)
+
+        if not valid_items:
+            return
+
+        if frames:
+            if len(frames) > 1:
+                log.debug(f"Batched {len(frames)} stream frames")
+            self._stream_pipeline.transcribe_step(frames)
+
+        for item in valid_items:
+            stream_id = item.payload["stream_id"]
+            session = self._stream_sessions.get(stream_id)
+
+            if stream_id in frame_stream_ids and session is not None:
+                int_id = session["int_id"]
+                state = self._stream_pipeline.get_state(int_id)
+                if state is not None:
+                    final = getattr(state, 'final_transcript', '') or ''
+                    partial = getattr(state, 'partial_transcript', '') or ''
+                    if final:
+                        session["committed_text"] += " " + final
+                    if partial:
+                        session["last_partial"] = partial
+                    result = {
+                        "stream_id": stream_id,
+                        "partial_transcript": partial,
+                        "final_transcript": final,
+                        "is_final": bool(final),
+                    }
+                else:
+                    result = {
+                        "stream_id": stream_id,
+                        "partial_transcript": "",
+                        "final_transcript": "",
+                        "is_final": False,
+                    }
+            else:
+                result = {
+                    "stream_id": stream_id,
+                    "partial_transcript": "",
+                    "final_transcript": "",
+                    "is_final": False,
+                }
+            item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
 
     def _run_pool_mode(self) -> None:
         log.info(f"Running in pool mode: {self._pool_size} model workers")
@@ -356,38 +506,45 @@ class GPUWorker:
     def _load_models(self) -> None:
         import nemo.collections.asr as nemo_asr
 
-        device = self._batch_cfg.get("device", "cuda:0")
-        self._pool_size = self._batch_cfg.get("model_pool_size", 1)
-
         torch.backends.cudnn.benchmark = True
         if hasattr(torch, 'set_float32_matmul_precision'):
             torch.set_float32_matmul_precision('high')
         log.info("Torch optimizations: cudnn.benchmark=True, matmul_precision=high")
 
-        if self._pool_size > 1:
-            log.info(f"Loading model pool: {self._pool_size} instances")
-            for i in range(self._pool_size):
-                model = self._load_one_model(nemo_asr, device, i)
-                self._batch_models.append(model)
-                torch.cuda.empty_cache()
-            self._batch_model = self._batch_models[0]
-        else:
-            self._batch_model = self._load_one_model(nemo_asr, device)
+        if self._batch_cfg.get("name"):
+            device = self._batch_cfg.get("device", "cuda:0")
+            self._pool_size = self._batch_cfg.get("model_pool_size", 1)
 
-        torch.cuda.empty_cache()
+            if self._pool_size > 1:
+                log.info(f"Loading model pool: {self._pool_size} instances")
+                for i in range(self._pool_size):
+                    model = self._load_one_model(nemo_asr, device, i)
+                    self._batch_models.append(model)
+                    torch.cuda.empty_cache()
+                self._batch_model = self._batch_models[0]
+            else:
+                self._batch_model = self._load_one_model(nemo_asr, device)
+
+            torch.cuda.empty_cache()
+        else:
+            log.info("No batch model configured, batch transcription will be unavailable")
 
         vram_used = torch.cuda.memory_allocated() / 1024**2
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
         log.info(f"VRAM after model load: {vram_used:.0f}MiB / {vram_total:.0f}MiB")
 
         self._build_stream_pipeline()
+
+        if self._batch_model is None and self._stream_pipeline is None:
+            raise RuntimeError("No models loaded — configure batch_model and/or stream_model")
+
         log.info("Models loaded and ready")
 
-    _LATENCY_MODE_TO_CONTEXT = {
-        "80ms": [70, 0],
-        "160ms": [70, 1],
-        "480ms": [70, 6],
-        "1040ms": [70, 13],
+    _LATENCY_MODE_TO_RIGHT_CONTEXT = {
+        "80ms": 0,
+        "160ms": 1,
+        "480ms": 6,
+        "1040ms": 13,
     }
 
     def _build_stream_pipeline(self) -> None:
@@ -409,8 +566,11 @@ class GPUWorker:
             os.path.dirname(__file__), "..", "conf", "asr_streaming_inference", "cache_aware_rnnt.yaml"
         )
         if not os.path.exists(ref_config_path):
-            log.warning(f"Streaming config not found at {ref_config_path}, streaming will be unavailable")
-            return
+            raise FileNotFoundError(
+                f"Streaming config not found at {ref_config_path}. "
+                "Copy examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml "
+                "to the expected path relative to the serving directory."
+            )
 
         base_cfg = OmegaConf.load(ref_config_path)
         overrides = OmegaConf.create({
@@ -425,19 +585,34 @@ class GPUWorker:
             "enable_nmt": False,
         })
 
-        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
-        context = self._LATENCY_MODE_TO_CONTEXT.get(latency_mode)
-        if context is not None:
-            overrides["streaming"] = {"att_context_size": context}
-            log.info(f"Streaming latency mode: {latency_mode} (att_context_size={context})")
-
         source_lang = self._stream_cfg.get("source_language", "English")
         overrides["source_language"] = source_lang
         self._source_language = source_lang
 
+        overrides["streaming"] = {"att_context_size": None}
         cfg = OmegaConf.merge(base_cfg, overrides)
 
         self._stream_pipeline = PipelineBuilder.build_pipeline(cfg)
+
+        try:
+            self._stream_chunk_samples = int(
+                self._stream_pipeline.chunk_size_in_secs * self._stream_pipeline.sample_rate
+            )
+        except AttributeError:
+            self._stream_chunk_samples = int(self._stream_cfg.get("chunk_samples", 5120))
+        log.info(
+            f"Stream chunk target: {self._stream_chunk_samples} samples "
+            f"({self._stream_chunk_samples / 16000 * 1000:.0f}ms)"
+        )
+
+        latency_mode = self._stream_cfg.get("latency_mode", "480ms")
+        right_ctx = self._LATENCY_MODE_TO_RIGHT_CONTEXT.get(latency_mode)
+        if right_ctx is not None:
+            left_ctx = self._stream_pipeline.asr_model.get_att_context_size()[0]
+            att_context = [left_ctx, right_ctx]
+            self._stream_pipeline.asr_model.set_default_att_context_size(att_context)
+            log.info(f"Streaming latency mode: {latency_mode} (att_context_size={att_context})")
+
         # Initialize the session once — per-stream state is managed via
         # init_state() (called by transcribe_step when is_first=True) and
         # delete_state(). Do NOT call open_session() per stream — it resets
@@ -446,6 +621,8 @@ class GPUWorker:
         log.info("Streaming pipeline built and session opened")
 
     def _batch_transcribe(self, payload: dict) -> list:
+        if self._batch_model is None:
+            raise RuntimeError("Batch model not loaded — server started in streaming-only mode")
         return self._batch_transcribe_with_model(self._batch_model, payload)
 
     def _batch_transcribe_with_model(self, model, payload: dict) -> list:
@@ -490,6 +667,8 @@ class GPUWorker:
                 out.append(str(r))
         return out
 
+    _MAX_BUFFER_SAMPLES = 5120 * 10
+
     def _stream_open(self, payload: dict) -> dict:
         if self._stream_pipeline is None:
             raise RuntimeError("Streaming pipeline not available")
@@ -502,12 +681,18 @@ class GPUWorker:
             "int_id": stream_int_id,
             "chunk_index": 0,
             "created_at": time.monotonic(),
+            "committed_text": "",
+            "last_partial": "",
+            "audio_buffer": bytearray(),
+            "buffer_samples": 0,
+            "frames_sent": 0,
         }
         return {"stream_id": stream_id, "status": "opened"}
 
     def _stream_chunk(self, payload: dict) -> dict:
         from nemo.collections.asr.inference.streaming.framing.request import Frame
         from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+        import numpy as np
 
         stream_id = payload["stream_id"]
         audio_chunk = payload["audio_chunk"]
@@ -516,37 +701,54 @@ class GPUWorker:
         if session is None:
             raise ValueError(f"Unknown stream: {stream_id}")
 
-        chunk_index = session["chunk_index"]
-        is_first = chunk_index == 0
-        session["chunk_index"] = chunk_index + 1
+        session["chunk_index"] += 1
+        session["audio_buffer"].extend(audio_chunk.astype(np.float32).tobytes())
+        session["buffer_samples"] += len(audio_chunk)
 
-        samples = torch.tensor(audio_chunk, dtype=torch.float32)
-        options = (
-            ASRRequestOptions(
-                enable_itn=False,
-                enable_nmt=False,
-                source_language=self._source_language,
-            )
-            if is_first
-            else None
-        )
-
-        frame = Frame(
-            samples=samples,
-            stream_id=session["int_id"],
-            is_first=is_first,
-            is_last=False,
-            options=options,
-        )
-
-        outputs = self._stream_pipeline.transcribe_step([frame])
-        output = outputs[0] if outputs else None
+        if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
+            excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
+            session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+            session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
 
         partial = ""
         final = ""
-        if output is not None:
-            partial = getattr(output, 'partial_transcript', '') or ''
-            final = getattr(output, 'final_transcript', '') or ''
+        chunk_bytes = self._stream_chunk_samples * 4
+
+        while session["buffer_samples"] >= self._stream_chunk_samples:
+            raw = bytes(session["audio_buffer"][:chunk_bytes])
+            session["audio_buffer"] = session["audio_buffer"][chunk_bytes:]
+            session["buffer_samples"] -= self._stream_chunk_samples
+
+            is_first = session["frames_sent"] == 0
+            session["frames_sent"] += 1
+
+            samples = torch.frombuffer(raw, dtype=torch.float32).clone()
+            options = (
+                ASRRequestOptions(
+                    enable_itn=False,
+                    enable_nmt=False,
+                    source_language=self._source_language,
+                )
+                if is_first
+                else None
+            )
+            frame = Frame(
+                samples=samples,
+                stream_id=session["int_id"],
+                is_first=is_first,
+                is_last=False,
+                options=options,
+            )
+            self._stream_pipeline.transcribe_step([frame])
+            state = self._stream_pipeline.get_state(session["int_id"])
+
+            if state is not None:
+                partial = getattr(state, 'partial_transcript', '') or ''
+                final = getattr(state, 'final_transcript', '') or ''
+                if final:
+                    session["committed_text"] += " " + final
+                if partial:
+                    session["last_partial"] = partial
 
         return {
             "stream_id": stream_id,
@@ -556,19 +758,43 @@ class GPUWorker:
         }
 
     def _stream_close(self, payload: dict) -> dict:
+        from nemo.collections.asr.inference.streaming.framing.request import Frame
+        from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+
         stream_id = payload["stream_id"]
         session = self._stream_sessions.pop(stream_id, None)
 
         if session is None:
             return {"stream_id": stream_id, "status": "not_found"}
 
-        final_text = ""
+        final_text = session.get("committed_text", "").strip()
+        last_partial = session.get("last_partial", "").strip()
 
-        # Only send final frame if chunks were actually processed
-        if session["chunk_index"] > 0:
-            from nemo.collections.asr.inference.streaming.framing.request import Frame
-            from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
+        # Flush any remaining buffered audio
+        if session["buffer_samples"] > 0:
+            raw = bytes(session["audio_buffer"][:session["buffer_samples"] * 4])
+            is_first = session["frames_sent"] == 0
+            samples = torch.frombuffer(raw, dtype=torch.float32).clone()
+            options = (
+                ASRRequestOptions(
+                    enable_itn=False, enable_nmt=False,
+                    source_language=self._source_language,
+                )
+                if is_first else None
+            )
+            frame = Frame(
+                samples=samples, stream_id=session["int_id"],
+                is_first=is_first, is_last=False, options=options,
+            )
+            self._stream_pipeline.transcribe_step([frame])
+            session["frames_sent"] += 1
+            state = self._stream_pipeline.get_state(session["int_id"])
+            if state is not None:
+                flushed = getattr(state, 'final_transcript', '') or ''
+                if flushed:
+                    final_text = (final_text + " " + flushed).strip()
 
+        if session["frames_sent"] > 0:
             frame = Frame(
                 samples=torch.zeros(1, dtype=torch.float32),
                 stream_id=session["int_id"],
@@ -576,12 +802,20 @@ class GPUWorker:
                 is_last=True,
                 options=ASRRequestOptions(enable_itn=False, enable_nmt=False),
             )
-            outputs = self._stream_pipeline.transcribe_step([frame])
-            output = outputs[0] if outputs else None
-            if output is not None:
-                final_text = getattr(output, 'final_transcript', '') or ''
+            self._stream_pipeline.transcribe_step([frame])
+            state = self._stream_pipeline.get_state(session["int_id"])
+            if state is not None:
+                remaining_final = getattr(state, 'final_transcript', '') or ''
+                remaining_partial = getattr(state, 'partial_transcript', '') or ''
+                if remaining_final:
+                    final_text = (final_text + " " + remaining_final).strip()
+                elif remaining_partial and not final_text:
+                    final_text = remaining_partial.strip()
 
             self._stream_pipeline.delete_state(session["int_id"])
+
+        if not final_text and last_partial:
+            final_text = last_partial
 
         return {
             "stream_id": stream_id,

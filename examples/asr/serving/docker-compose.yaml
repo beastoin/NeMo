@@ -1,9 +1,12 @@
-# Parakeet TDT batch ASR server — single command deploy.
+# NeMo ASR serving — batch and/or streaming, single command deploy.
 #
-# Start:   docker compose up -d
-# Logs:    docker compose logs -f
-# Stop:    docker compose down
-# Health:  curl http://localhost:8000/health
+# Batch only:     docker compose up -d parakeet-batch
+# Streaming only: docker compose up -d nemotron-stream
+# Both:           docker compose up -d
+# Logs:           docker compose logs -f
+# Stop:           docker compose down
+# Health:         curl http://localhost:8000/health  (batch)
+#                 curl http://localhost:8001/health  (stream)
 #
 # Requires: Docker with NVIDIA Container Toolkit (nvidia-docker2)
 # Install:  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
@@ -19,7 +22,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - model-cache:/app/.cache/huggingface
+      - model-cache-batch:/app/.cache/huggingface
       - /tmp/parakeet-uploads:/tmp
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -47,5 +50,43 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  nemotron-stream:
+    build:
+      context: ../../../..
+      dockerfile: examples/asr/serving/Dockerfile.stream
+    image: nemotron-stream:latest
+    container_name: nemotron-stream
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - model-cache-stream:/app/.cache/huggingface
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          cpus: "4"
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
 volumes:
-  model-cache:
+  model-cache-batch:
+  model-cache-stream:

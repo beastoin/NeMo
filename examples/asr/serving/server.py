@@ -108,7 +108,8 @@ async def lifespan(app: FastAPI):
         max_concurrent_streams=stream_cfg.get("max_concurrent_streams", 128),
         chunk_duration_ms=stream_cfg.get("chunk_duration_ms", 160),
         sample_rate=stream_cfg.get("sample_rate", 16000),
-        max_stream_duration=stream_cfg.get("max_stream_duration", 1800),
+        max_stream_duration=stream_cfg.get("max_stream_duration", 0),
+        idle_timeout=stream_cfg.get("idle_timeout", 300),
         max_chunk_bytes=stream_cfg.get("max_chunk_bytes", 512 * 1024),
     )
     await stream_engine.start()
@@ -212,12 +213,21 @@ def _save_upload_sync(src_file, suffix: str, max_bytes: int) -> str:
     return tmp_path
 
 
+def _require_batch_model():
+    if not config.get("batch_model", {}).get("name"):
+        raise HTTPException(
+            status_code=404,
+            detail="Batch transcription not available — server running in streaming-only mode",
+        )
+
+
 @app.post("/v1/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
     timestamps: bool = Query(False, description="Include word-level timestamps"),
 ):
     """Transcribe an audio file using Parakeet TDT with dynamic batching."""
+    _require_batch_model()
     max_bytes = _max_upload_bytes()
     suffix = Path(file.filename).suffix if file.filename else ".wav"
 
@@ -243,6 +253,7 @@ async def transcribe_batch(
     timestamps: bool = Query(False),
 ):
     """Transcribe multiple files. All are batched together for GPU efficiency."""
+    _require_batch_model()
     if len(files) > _MAX_BATCH_FILES:
         raise HTTPException(status_code=400, detail=f"Too many files (max {_MAX_BATCH_FILES})")
 
@@ -316,6 +327,10 @@ async def stream_ws(websocket: WebSocket):
         await websocket.send_json({"error": "Too many active streams"})
         await websocket.close(code=1013)
         return
+    except Exception as exc:
+        await websocket.send_json({"error": str(exc)})
+        await websocket.close(code=1011)
+        return
 
     try:
         while True:
@@ -325,7 +340,11 @@ async def stream_ws(websocket: WebSocket):
                 break
 
             if "bytes" in message:
-                result = await stream_engine.process_chunk(stream_id, message["bytes"])
+                try:
+                    result = await stream_engine.process_chunk(stream_id, message["bytes"])
+                except ValueError:
+                    await websocket.send_json({"error": "Stream closed by server (idle timeout)"})
+                    break
                 await websocket.send_json(result)
 
             elif "text" in message:
@@ -339,7 +358,10 @@ async def stream_ws(websocket: WebSocket):
         await websocket.send_json({"error": str(exc)})
     except Exception as exc:
         log.error(f"Stream {stream_id} error: {exc}")
-        await websocket.send_json({"error": str(exc)})
+        try:
+            await websocket.send_json({"error": str(exc)})
+        except Exception:
+            pass
     finally:
         final = await stream_engine.close_stream(stream_id)
         try:

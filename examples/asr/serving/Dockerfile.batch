@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir \
 COPY examples/asr/serving/server.py \
      examples/asr/serving/gpu_worker.py \
      examples/asr/serving/batch_engine.py \
+     examples/asr/serving/stream_engine.py \
      ./
 
 COPY examples/asr/serving/conf/serving-batch.yaml conf/serving-batch.yaml
