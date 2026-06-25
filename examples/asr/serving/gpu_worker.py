@@ -320,7 +320,7 @@ class GPUWorker:
             session = self._stream_sessions.get(stream_id)
 
             if stream_id in frame_stream_ids and session is not None:
-                step_outputs = output_by_int_id.get(session["int_id"], [])
+                step_outputs = output_by_int_id.pop(session["int_id"], [])
                 final = ""
                 partial = ""
                 for out in step_outputs:
