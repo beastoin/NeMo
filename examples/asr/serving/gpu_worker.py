@@ -198,13 +198,9 @@ class GPUWorker:
                     break
                 try:
                     result = self._dispatch(non_chunk_item)
-                    non_chunk_item.loop.call_soon_threadsafe(
-                        self._safe_set_result, non_chunk_item.future, result
-                    )
+                    non_chunk_item.loop.call_soon_threadsafe(self._safe_set_result, non_chunk_item.future, result)
                 except Exception as exc:
-                    non_chunk_item.loop.call_soon_threadsafe(
-                        self._safe_set_exception, non_chunk_item.future, exc
-                    )
+                    non_chunk_item.loop.call_soon_threadsafe(self._safe_set_exception, non_chunk_item.future, exc)
 
             # If no stream work, check batch queue
             if not stream_items and non_chunk_item is None:
@@ -252,8 +248,7 @@ class GPUWorker:
             session = self._stream_sessions.get(stream_id)
             if session is None:
                 item.loop.call_soon_threadsafe(
-                    self._safe_set_exception, item.future,
-                    ValueError(f"Unknown stream: {stream_id}")
+                    self._safe_set_exception, item.future, ValueError(f"Unknown stream: {stream_id}")
                 )
                 continue
 
@@ -263,7 +258,7 @@ class GPUWorker:
 
             if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
                 excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
-                session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+                session["audio_buffer"] = session["audio_buffer"][excess * 4 :]
                 session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
 
             valid_items.append(item)
@@ -279,52 +274,58 @@ class GPUWorker:
                 samples = torch.frombuffer(raw, dtype=torch.float32).clone()
                 options = (
                     ASRRequestOptions(
-                        enable_itn=False, enable_nmt=False,
+                        enable_itn=False,
+                        enable_nmt=False,
                         source_language=self._source_language,
                     )
-                    if is_first else None
+                    if is_first
+                    else None
                 )
-                frames.append(Frame(
-                    samples=samples, stream_id=session["int_id"],
-                    is_first=is_first, is_last=False, options=options,
-                ))
+                frames.append(
+                    Frame(
+                        samples=samples,
+                        stream_id=session["int_id"],
+                        is_first=is_first,
+                        is_last=False,
+                        options=options,
+                    )
+                )
                 frame_stream_ids.add(stream_id)
 
         if not valid_items:
             return
 
+        output_by_int_id = {}
         if frames:
             if len(frames) > 1:
                 log.debug(f"Batched {len(frames)} stream frames")
-            self._stream_pipeline.transcribe_step(frames)
+            outputs = self._stream_pipeline.transcribe_step(frames)
+            for out in outputs:
+                output_by_int_id.setdefault(out.stream_id, []).append(out)
 
         for item in valid_items:
             stream_id = item.payload["stream_id"]
             session = self._stream_sessions.get(stream_id)
 
             if stream_id in frame_stream_ids and session is not None:
-                int_id = session["int_id"]
-                state = self._stream_pipeline.get_state(int_id)
-                if state is not None:
-                    final = getattr(state, 'final_transcript', '') or ''
-                    partial = getattr(state, 'partial_transcript', '') or ''
-                    if final:
-                        session["committed_text"] += " " + final
-                    if partial:
-                        session["last_partial"] = partial
-                    result = {
-                        "stream_id": stream_id,
-                        "partial_transcript": partial,
-                        "final_transcript": final,
-                        "is_final": bool(final),
-                    }
-                else:
-                    result = {
-                        "stream_id": stream_id,
-                        "partial_transcript": "",
-                        "final_transcript": "",
-                        "is_final": False,
-                    }
+                step_outputs = output_by_int_id.get(session["int_id"], [])
+                final = ""
+                partial = ""
+                for out in step_outputs:
+                    if out.final_transcript:
+                        final = (final + out.final_transcript).strip()
+                    if out.partial_transcript:
+                        partial = out.partial_transcript
+                if final:
+                    session["committed_text"] += " " + final
+                if partial:
+                    session["last_partial"] = partial
+                result = {
+                    "stream_id": stream_id,
+                    "partial_transcript": partial,
+                    "final_transcript": final,
+                    "is_final": bool(final),
+                }
             else:
                 result = {
                     "stream_id": stream_id,
@@ -340,8 +341,10 @@ class GPUWorker:
             q = queue.Queue(maxsize=_MAX_GPU_QUEUE)
             self._pool_queues.append(q)
             t = threading.Thread(
-                target=self._pool_worker_loop, args=(i, self._batch_models[i], q),
-                daemon=True, name=f"gpu-pool-{i}",
+                target=self._pool_worker_loop,
+                args=(i, self._batch_models[i], q),
+                daemon=True,
+                name=f"gpu-pool-{i}",
             )
             self._pool_threads.append(t)
             t.start()
@@ -394,9 +397,7 @@ class GPUWorker:
     def _run_prefetch_mode(self) -> None:
         log.info("Running in prefetch mode (tensor bypass)")
         self._prefetch_queue = queue.Queue(maxsize=4)
-        self._prefetch_thread = threading.Thread(
-            target=self._prefetch_loop, daemon=True, name="prefetch"
-        )
+        self._prefetch_thread = threading.Thread(target=self._prefetch_loop, daemon=True, name="prefetch")
         self._prefetch_thread.start()
 
         while self._running:
@@ -444,6 +445,7 @@ class GPUWorker:
                         data, sr = sf.read(path, dtype='float32')
                         if sr != 16000:
                             import librosa
+
                             data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                         audio_arrays.append(np.array(data, dtype=np.float32))
                     item.payload["audio_tensors"] = audio_arrays
@@ -490,9 +492,7 @@ class GPUWorker:
     def _load_one_model(self, nemo_asr, device, idx=0):
         tag = f" (pool #{idx})" if self._pool_size > 1 else ""
         log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
-        model = nemo_asr.models.ASRModel.from_pretrained(
-            self._batch_cfg["name"], map_location=device
-        )
+        model = nemo_asr.models.ASRModel.from_pretrained(self._batch_cfg["name"], map_location=device)
         model.eval()
         if not self._batch_cfg.get("cuda_graphs", True):
             if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
@@ -573,17 +573,19 @@ class GPUWorker:
             )
 
         base_cfg = OmegaConf.load(ref_config_path)
-        overrides = OmegaConf.create({
-            "asr": {
-                "model_name": self._stream_cfg["name"],
-                "device": device_name,
-                "device_id": device_id,
-                "compute_dtype": "float16",
-                "use_amp": self._stream_cfg.get("amp", True),
-            },
-            "enable_itn": False,
-            "enable_nmt": False,
-        })
+        overrides = OmegaConf.create(
+            {
+                "asr": {
+                    "model_name": self._stream_cfg["name"],
+                    "device": device_name,
+                    "device_id": device_id,
+                    "compute_dtype": "float16",
+                    "use_amp": self._stream_cfg.get("amp", True),
+                },
+                "enable_itn": False,
+                "enable_nmt": False,
+            }
+        )
 
         source_lang = self._stream_cfg.get("source_language", "English")
         overrides["source_language"] = source_lang
@@ -656,8 +658,14 @@ class GPUWorker:
                         if k == 'timestep':
                             continue
                         ts[k] = [
-                            {ek: (round(ev, 4) if isinstance(ev, float) else str(ev) if not isinstance(ev, (int, str)) else ev)
-                             for ek, ev in e.items()}
+                            {
+                                ek: (
+                                    round(ev, 4)
+                                    if isinstance(ev, float)
+                                    else str(ev) if not isinstance(ev, (int, str)) else ev
+                                )
+                                for ek, ev in e.items()
+                            }
                             for e in entries
                         ]
                 out.append({"text": str(r.text), "timestamp": ts})
@@ -690,9 +698,10 @@ class GPUWorker:
         return {"stream_id": stream_id, "status": "opened"}
 
     def _stream_chunk(self, payload: dict) -> dict:
+        import numpy as np
+
         from nemo.collections.asr.inference.streaming.framing.request import Frame
         from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
-        import numpy as np
 
         stream_id = payload["stream_id"]
         audio_chunk = payload["audio_chunk"]
@@ -707,7 +716,7 @@ class GPUWorker:
 
         if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
             excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
-            session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+            session["audio_buffer"] = session["audio_buffer"][excess * 4 :]
             session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
 
         partial = ""
@@ -739,12 +748,11 @@ class GPUWorker:
                 is_last=False,
                 options=options,
             )
-            self._stream_pipeline.transcribe_step([frame])
-            state = self._stream_pipeline.get_state(session["int_id"])
-
-            if state is not None:
-                partial = getattr(state, 'partial_transcript', '') or ''
-                final = getattr(state, 'final_transcript', '') or ''
+            outputs = self._stream_pipeline.transcribe_step([frame])
+            if outputs:
+                out = outputs[0]
+                partial = out.partial_transcript or ''
+                final = out.final_transcript or ''
                 if final:
                     session["committed_text"] += " " + final
                 if partial:
@@ -772,29 +780,35 @@ class GPUWorker:
 
         # Flush any remaining buffered audio
         if session["buffer_samples"] > 0:
-            raw = bytes(session["audio_buffer"][:session["buffer_samples"] * 4])
+            raw = bytes(session["audio_buffer"][: session["buffer_samples"] * 4])
             is_first = session["frames_sent"] == 0
             samples = torch.frombuffer(raw, dtype=torch.float32).clone()
             options = (
                 ASRRequestOptions(
-                    enable_itn=False, enable_nmt=False,
+                    enable_itn=False,
+                    enable_nmt=False,
                     source_language=self._source_language,
                 )
-                if is_first else None
+                if is_first
+                else None
             )
             frame = Frame(
-                samples=samples, stream_id=session["int_id"],
-                is_first=is_first, is_last=False, options=options,
+                samples=samples,
+                stream_id=session["int_id"],
+                is_first=is_first,
+                is_last=False,
+                options=options,
             )
-            self._stream_pipeline.transcribe_step([frame])
+            outputs = self._stream_pipeline.transcribe_step([frame])
             session["frames_sent"] += 1
-            state = self._stream_pipeline.get_state(session["int_id"])
-            if state is not None:
-                flushed = getattr(state, 'final_transcript', '') or ''
+            if outputs:
+                flushed = outputs[0].final_transcript or ''
                 if flushed:
                     final_text = (final_text + " " + flushed).strip()
 
         if session["frames_sent"] > 0:
+            # is_last=True triggers forced finalization with keep_all_outputs=True;
+            # pipeline creates TranscribeStepOutput before cleanup and state deletion
             frame = Frame(
                 samples=torch.zeros(1, dtype=torch.float32),
                 stream_id=session["int_id"],
@@ -802,17 +816,14 @@ class GPUWorker:
                 is_last=True,
                 options=ASRRequestOptions(enable_itn=False, enable_nmt=False),
             )
-            self._stream_pipeline.transcribe_step([frame])
-            state = self._stream_pipeline.get_state(session["int_id"])
-            if state is not None:
-                remaining_final = getattr(state, 'final_transcript', '') or ''
-                remaining_partial = getattr(state, 'partial_transcript', '') or ''
+            outputs = self._stream_pipeline.transcribe_step([frame])
+            if outputs:
+                remaining_final = outputs[0].final_transcript or ''
+                remaining_partial = outputs[0].partial_transcript or ''
                 if remaining_final:
                     final_text = (final_text + " " + remaining_final).strip()
                 elif remaining_partial and not final_text:
                     final_text = remaining_partial.strip()
-
-            self._stream_pipeline.delete_state(session["int_id"])
 
         if not final_text and last_partial:
             final_text = last_partial
