@@ -299,9 +299,21 @@ class GPUWorker:
         if frames:
             if len(frames) > 1:
                 log.debug(f"Batched {len(frames)} stream frames")
-            outputs = self._stream_pipeline.transcribe_step(frames)
-            for out in outputs:
-                output_by_int_id.setdefault(out.stream_id, []).append(out)
+            remaining = list(frames)
+            while remaining:
+                batch = []
+                seen = set()
+                deferred = []
+                for f in remaining:
+                    if f.stream_id not in seen:
+                        batch.append(f)
+                        seen.add(f.stream_id)
+                    else:
+                        deferred.append(f)
+                outputs = self._stream_pipeline.transcribe_step(batch)
+                for out in outputs:
+                    output_by_int_id.setdefault(out.stream_id, []).append(out)
+                remaining = deferred
 
         for item in valid_items:
             stream_id = item.payload["stream_id"]
@@ -752,9 +764,10 @@ class GPUWorker:
             if outputs:
                 out = outputs[0]
                 partial = out.partial_transcript or ''
-                final = out.final_transcript or ''
-                if final:
-                    session["committed_text"] += " " + final
+                step_final = out.final_transcript or ''
+                if step_final:
+                    final = (final + " " + step_final).strip() if final else step_final
+                    session["committed_text"] += " " + step_final
                 if partial:
                     session["last_partial"] = partial
 
