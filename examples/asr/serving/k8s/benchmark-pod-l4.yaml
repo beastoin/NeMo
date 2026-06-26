@@ -57,8 +57,11 @@ spec:
           cd /workspace/fork/examples/asr/serving
 
           if [ "$MODE" = "batch" ]; then
-            echo "Starting batch server (compile=true, cuda_graphs=true on L4)..."
-            exec python server.py --config conf/serving-batch.yaml --host 0.0.0.0 --port 8000
+            # cuda_graphs crashes under high concurrency on L4 — disable for stability
+            cp conf/serving-batch.yaml conf/serving-batch-bench.yaml
+            sed -i 's/cuda_graphs:.*/cuda_graphs: false/' conf/serving-batch-bench.yaml
+            echo "Starting batch server (compile=true, cuda_graphs=false)..."
+            exec python server.py --config conf/serving-batch-bench.yaml --host 0.0.0.0 --port 8000
           else
             echo "Starting streaming server..."
             exec python server.py --config conf/serving-stream.yaml --host 0.0.0.0 --port 8000
@@ -103,7 +106,7 @@ spec:
         sizeLimit: 10Gi
     - name: tmp
       emptyDir:
-        sizeLimit: 1Gi
+        sizeLimit: 5Gi
   nodeSelector:
     cloud.google.com/gke-nodepool: parakeet-pool
   tolerations:

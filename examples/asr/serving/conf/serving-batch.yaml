@@ -13,7 +13,7 @@ batch_model:
   device: "cuda:0"
   compile: true
   amp: true
-  cuda_graphs: true
+  cuda_graphs: false  # CUDA Graph conditional nodes crash under high concurrency on both L4 and T4
 
 batcher:
   max_batch_size: 32
