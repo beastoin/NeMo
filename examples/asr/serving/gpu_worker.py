@@ -645,14 +645,25 @@ class GPUWorker:
 
         audio_input = payload.get("audio_tensors", payload["audio_paths"])
 
-        results = model.transcribe(
-            audio_input,
-            batch_size=batch_size,
-            timestamps=timestamps,
-            return_hypotheses=timestamps,
-            num_workers=0,
-            verbose=False,
-        )
+        if self._batch_cfg.get("amp", False):
+            with torch.autocast("cuda", dtype=torch.float16):
+                results = model.transcribe(
+                    audio_input,
+                    batch_size=batch_size,
+                    timestamps=timestamps,
+                    return_hypotheses=timestamps,
+                    num_workers=0,
+                    verbose=False,
+                )
+        else:
+            results = model.transcribe(
+                audio_input,
+                batch_size=batch_size,
+                timestamps=timestamps,
+                return_hypotheses=timestamps,
+                num_workers=0,
+                verbose=False,
+            )
         serialized = self._extract_results(results, timestamps)
         del results
         return serialized
