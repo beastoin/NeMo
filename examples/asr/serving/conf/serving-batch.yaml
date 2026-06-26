@@ -13,6 +13,7 @@ batch_model:
   device: "cuda:0"
   compile: true
   amp: true
+  cuda_graphs: true
 
 batcher:
   max_batch_size: 32
