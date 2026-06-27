@@ -506,6 +506,11 @@ class GPUWorker:
         log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
         model = nemo_asr.models.ASRModel.from_pretrained(self._batch_cfg["name"], map_location=device)
         model.eval()
+        if self._batch_cfg.get("local_attn", False):
+            attn_ctx = self._batch_cfg.get("local_attn_context", [128, 128])
+            model.change_attention_model("rel_pos_local_attn", attn_ctx)
+            model.change_subsampling_conv_chunking_factor(1)
+            log.info(f"Switched to local attention{tag} (context={attn_ctx}) — linear VRAM scaling")
         if not self._batch_cfg.get("cuda_graphs", True):
             if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
                 disabled = model.decoding.decoding.disable_cuda_graphs()
