@@ -6,3 +6,6 @@ pyyaml>=6.0
 numpy>=1.24.0
 # Stress test client
 aiohttp>=3.9.0
+# WER evaluation (industry-standard text normalization)
+jiwer>=3.0.0
+whisper-normalizer>=0.1.0

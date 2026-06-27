@@ -242,6 +242,10 @@ async def transcribe(
         return JSONResponse(content=result)
     except QueueFullError:
         raise HTTPException(status_code=503, detail="Server overloaded — try again later")
+    except RuntimeError as exc:
+        if "max_file_duration_sec" in str(exc):
+            raise HTTPException(status_code=413, detail=str(exc))
+        raise
 
 
 _MAX_BATCH_FILES = 64

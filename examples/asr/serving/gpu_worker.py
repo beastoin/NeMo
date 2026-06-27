@@ -79,6 +79,12 @@ class GPUWorker:
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
+        self._attn_mode = "full"
+        self._attn_auto_threshold_sec = 600
+        self._attn_local_context = [128, 128]
+        self._attn_is_local = False
+        self._max_file_duration_sec = 0
+        self._raw_batch_model = None
 
     @property
     def is_ready(self) -> bool:
@@ -198,13 +204,9 @@ class GPUWorker:
                     break
                 try:
                     result = self._dispatch(non_chunk_item)
-                    non_chunk_item.loop.call_soon_threadsafe(
-                        self._safe_set_result, non_chunk_item.future, result
-                    )
+                    non_chunk_item.loop.call_soon_threadsafe(self._safe_set_result, non_chunk_item.future, result)
                 except Exception as exc:
-                    non_chunk_item.loop.call_soon_threadsafe(
-                        self._safe_set_exception, non_chunk_item.future, exc
-                    )
+                    non_chunk_item.loop.call_soon_threadsafe(self._safe_set_exception, non_chunk_item.future, exc)
 
             # If no stream work, check batch queue
             if not stream_items and non_chunk_item is None:
@@ -252,8 +254,7 @@ class GPUWorker:
             session = self._stream_sessions.get(stream_id)
             if session is None:
                 item.loop.call_soon_threadsafe(
-                    self._safe_set_exception, item.future,
-                    ValueError(f"Unknown stream: {stream_id}")
+                    self._safe_set_exception, item.future, ValueError(f"Unknown stream: {stream_id}")
                 )
                 continue
 
@@ -263,7 +264,7 @@ class GPUWorker:
 
             if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
                 excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
-                session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+                session["audio_buffer"] = session["audio_buffer"][excess * 4 :]
                 session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
 
             valid_items.append(item)
@@ -279,52 +280,70 @@ class GPUWorker:
                 samples = torch.frombuffer(raw, dtype=torch.float32).clone()
                 options = (
                     ASRRequestOptions(
-                        enable_itn=False, enable_nmt=False,
+                        enable_itn=False,
+                        enable_nmt=False,
                         source_language=self._source_language,
                     )
-                    if is_first else None
+                    if is_first
+                    else None
                 )
-                frames.append(Frame(
-                    samples=samples, stream_id=session["int_id"],
-                    is_first=is_first, is_last=False, options=options,
-                ))
+                frames.append(
+                    Frame(
+                        samples=samples,
+                        stream_id=session["int_id"],
+                        is_first=is_first,
+                        is_last=False,
+                        options=options,
+                    )
+                )
                 frame_stream_ids.add(stream_id)
 
         if not valid_items:
             return
 
+        output_by_int_id = {}
         if frames:
             if len(frames) > 1:
                 log.debug(f"Batched {len(frames)} stream frames")
-            self._stream_pipeline.transcribe_step(frames)
+            remaining = list(frames)
+            while remaining:
+                batch = []
+                seen = set()
+                deferred = []
+                for f in remaining:
+                    if f.stream_id not in seen:
+                        batch.append(f)
+                        seen.add(f.stream_id)
+                    else:
+                        deferred.append(f)
+                outputs = self._stream_pipeline.transcribe_step(batch)
+                for out in outputs:
+                    output_by_int_id.setdefault(out.stream_id, []).append(out)
+                remaining = deferred
 
         for item in valid_items:
             stream_id = item.payload["stream_id"]
             session = self._stream_sessions.get(stream_id)
 
             if stream_id in frame_stream_ids and session is not None:
-                int_id = session["int_id"]
-                state = self._stream_pipeline.get_state(int_id)
-                if state is not None:
-                    final = getattr(state, 'final_transcript', '') or ''
-                    partial = getattr(state, 'partial_transcript', '') or ''
-                    if final:
-                        session["committed_text"] += " " + final
-                    if partial:
-                        session["last_partial"] = partial
-                    result = {
-                        "stream_id": stream_id,
-                        "partial_transcript": partial,
-                        "final_transcript": final,
-                        "is_final": bool(final),
-                    }
-                else:
-                    result = {
-                        "stream_id": stream_id,
-                        "partial_transcript": "",
-                        "final_transcript": "",
-                        "is_final": False,
-                    }
+                step_outputs = output_by_int_id.pop(session["int_id"], [])
+                final = ""
+                partial = ""
+                for out in step_outputs:
+                    if out.final_transcript:
+                        final = (final + out.final_transcript).strip()
+                    if out.partial_transcript:
+                        partial = out.partial_transcript
+                if final:
+                    session["committed_text"] += " " + final
+                if partial:
+                    session["last_partial"] = partial
+                result = {
+                    "stream_id": stream_id,
+                    "partial_transcript": partial,
+                    "final_transcript": final,
+                    "is_final": bool(final),
+                }
             else:
                 result = {
                     "stream_id": stream_id,
@@ -340,8 +359,10 @@ class GPUWorker:
             q = queue.Queue(maxsize=_MAX_GPU_QUEUE)
             self._pool_queues.append(q)
             t = threading.Thread(
-                target=self._pool_worker_loop, args=(i, self._batch_models[i], q),
-                daemon=True, name=f"gpu-pool-{i}",
+                target=self._pool_worker_loop,
+                args=(i, self._batch_models[i], q),
+                daemon=True,
+                name=f"gpu-pool-{i}",
             )
             self._pool_threads.append(t)
             t.start()
@@ -394,9 +415,7 @@ class GPUWorker:
     def _run_prefetch_mode(self) -> None:
         log.info("Running in prefetch mode (tensor bypass)")
         self._prefetch_queue = queue.Queue(maxsize=4)
-        self._prefetch_thread = threading.Thread(
-            target=self._prefetch_loop, daemon=True, name="prefetch"
-        )
+        self._prefetch_thread = threading.Thread(target=self._prefetch_loop, daemon=True, name="prefetch")
         self._prefetch_thread.start()
 
         while self._running:
@@ -444,6 +463,7 @@ class GPUWorker:
                         data, sr = sf.read(path, dtype='float32')
                         if sr != 16000:
                             import librosa
+
                             data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                         audio_arrays.append(np.array(data, dtype=np.float32))
                     item.payload["audio_tensors"] = audio_arrays
@@ -490,17 +510,40 @@ class GPUWorker:
     def _load_one_model(self, nemo_asr, device, idx=0):
         tag = f" (pool #{idx})" if self._pool_size > 1 else ""
         log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
-        model = nemo_asr.models.ASRModel.from_pretrained(
-            self._batch_cfg["name"], map_location=device
-        )
+        model = nemo_asr.models.ASRModel.from_pretrained(self._batch_cfg["name"], map_location=device)
         model.eval()
+
+        self._attn_mode = self._batch_cfg.get("attention_mode", "full")
+        self._attn_local_context = self._batch_cfg.get("local_attn_context", [128, 128])
+        self._attn_auto_threshold_sec = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
+        self._max_file_duration_sec = self._batch_cfg.get("max_file_duration_sec", 0)
+
+        if self._attn_mode == "local":
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            model.change_subsampling_conv_chunking_factor(1)
+            self._attn_is_local = True
+            log.info(f"Attention mode: local{tag} (context={self._attn_local_context}) — linear VRAM scaling")
+        elif self._attn_mode == "auto":
+            log.info(
+                f"Attention mode: auto{tag} — full for <{self._attn_auto_threshold_sec}s, "
+                f"local for >={self._attn_auto_threshold_sec}s (torch.compile disabled for auto mode)"
+            )
+            self._raw_batch_model = model
+        else:
+            log.info(f"Attention mode: full{tag} (default)")
+
+        if self._max_file_duration_sec > 0:
+            log.info(f"Max file duration: {self._max_file_duration_sec}s")
+
         if not self._batch_cfg.get("cuda_graphs", True):
             if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
                 disabled = model.decoding.decoding.disable_cuda_graphs()
                 log.info(f"CUDA graph decoding disabled{tag} (was active: {disabled})")
-        if self._batch_cfg.get("compile", False):
+        if self._batch_cfg.get("compile", False) and self._attn_mode != "auto":
             log.info(f"Compiling batch model{tag} with torch.compile")
             model = torch.compile(model)
+        elif self._attn_mode == "auto" and self._batch_cfg.get("compile", False):
+            log.info(f"Skipping torch.compile{tag} — incompatible with auto attention switching")
         return model
 
     def _load_models(self) -> None:
@@ -573,17 +616,19 @@ class GPUWorker:
             )
 
         base_cfg = OmegaConf.load(ref_config_path)
-        overrides = OmegaConf.create({
-            "asr": {
-                "model_name": self._stream_cfg["name"],
-                "device": device_name,
-                "device_id": device_id,
-                "compute_dtype": "float16",
-                "use_amp": self._stream_cfg.get("amp", True),
-            },
-            "enable_itn": False,
-            "enable_nmt": False,
-        })
+        overrides = OmegaConf.create(
+            {
+                "asr": {
+                    "model_name": self._stream_cfg["name"],
+                    "device": device_name,
+                    "device_id": device_id,
+                    "compute_dtype": "float16",
+                    "use_amp": self._stream_cfg.get("amp", True),
+                },
+                "enable_itn": False,
+                "enable_nmt": False,
+            }
+        )
 
         source_lang = self._stream_cfg.get("source_language", "English")
         overrides["source_language"] = source_lang
@@ -625,11 +670,61 @@ class GPUWorker:
             raise RuntimeError("Batch model not loaded — server started in streaming-only mode")
         return self._batch_transcribe_with_model(self._batch_model, payload)
 
+    def _get_audio_duration_sec(self, path: str) -> float:
+        try:
+            import torchaudio
+            info = torchaudio.info(path)
+            return info.num_frames / info.sample_rate
+        except Exception as exc:
+            try:
+                import wave
+                with wave.open(path) as wf:
+                    return wf.getnframes() / wf.getframerate()
+            except Exception:
+                log.warning(f"Cannot determine audio duration for {path}: {exc}")
+                return 0.0
+
+    def _switch_attention(self, to_local: bool) -> None:
+        if to_local == self._attn_is_local:
+            return
+        model = self._raw_batch_model
+        if model is None:
+            return
+        if to_local:
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            model.change_subsampling_conv_chunking_factor(1)
+            self._attn_is_local = True
+        else:
+            model.change_attention_model("rel_pos")
+            self._attn_is_local = False
+
     def _batch_transcribe_with_model(self, model, payload: dict) -> list:
         timestamps = payload.get("timestamps", False)
         batch_size = payload.get("batch_size", 16)
 
         audio_input = payload.get("audio_tensors", payload["audio_paths"])
+
+        if self._max_file_duration_sec > 0 and isinstance(audio_input, list):
+            for path in audio_input:
+                if isinstance(path, str):
+                    dur = self._get_audio_duration_sec(path)
+                    if dur > self._max_file_duration_sec:
+                        raise RuntimeError(
+                            f"Audio file {dur:.0f}s exceeds max_file_duration_sec "
+                            f"({self._max_file_duration_sec}s). Use shorter files or "
+                            f"set attention_mode: local/auto for longer audio."
+                        )
+
+        if self._attn_mode == "auto" and isinstance(audio_input, list):
+            max_dur = max(
+                (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
+                default=0.0,
+            )
+            need_local = max_dur >= self._attn_auto_threshold_sec
+            if need_local != self._attn_is_local:
+                mode_name = "local" if need_local else "full"
+                log.info(f"Auto-switching attention to {mode_name} (longest file: {max_dur:.0f}s)")
+                self._switch_attention(need_local)
 
         results = model.transcribe(
             audio_input,
@@ -656,8 +751,14 @@ class GPUWorker:
                         if k == 'timestep':
                             continue
                         ts[k] = [
-                            {ek: (round(ev, 4) if isinstance(ev, float) else str(ev) if not isinstance(ev, (int, str)) else ev)
-                             for ek, ev in e.items()}
+                            {
+                                ek: (
+                                    round(ev, 4)
+                                    if isinstance(ev, float)
+                                    else str(ev) if not isinstance(ev, (int, str)) else ev
+                                )
+                                for ek, ev in e.items()
+                            }
                             for e in entries
                         ]
                 out.append({"text": str(r.text), "timestamp": ts})
@@ -690,9 +791,10 @@ class GPUWorker:
         return {"stream_id": stream_id, "status": "opened"}
 
     def _stream_chunk(self, payload: dict) -> dict:
+        import numpy as np
+
         from nemo.collections.asr.inference.streaming.framing.request import Frame
         from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
-        import numpy as np
 
         stream_id = payload["stream_id"]
         audio_chunk = payload["audio_chunk"]
@@ -707,7 +809,7 @@ class GPUWorker:
 
         if session["buffer_samples"] > self._MAX_BUFFER_SAMPLES:
             excess = session["buffer_samples"] - self._MAX_BUFFER_SAMPLES
-            session["audio_buffer"] = session["audio_buffer"][excess * 4:]
+            session["audio_buffer"] = session["audio_buffer"][excess * 4 :]
             session["buffer_samples"] = self._MAX_BUFFER_SAMPLES
 
         partial = ""
@@ -739,14 +841,14 @@ class GPUWorker:
                 is_last=False,
                 options=options,
             )
-            self._stream_pipeline.transcribe_step([frame])
-            state = self._stream_pipeline.get_state(session["int_id"])
-
-            if state is not None:
-                partial = getattr(state, 'partial_transcript', '') or ''
-                final = getattr(state, 'final_transcript', '') or ''
-                if final:
-                    session["committed_text"] += " " + final
+            outputs = self._stream_pipeline.transcribe_step([frame])
+            if outputs:
+                out = outputs[0]
+                partial = out.partial_transcript or ''
+                step_final = out.final_transcript or ''
+                if step_final:
+                    final = (final + " " + step_final).strip() if final else step_final
+                    session["committed_text"] += " " + step_final
                 if partial:
                     session["last_partial"] = partial
 
@@ -772,29 +874,35 @@ class GPUWorker:
 
         # Flush any remaining buffered audio
         if session["buffer_samples"] > 0:
-            raw = bytes(session["audio_buffer"][:session["buffer_samples"] * 4])
+            raw = bytes(session["audio_buffer"][: session["buffer_samples"] * 4])
             is_first = session["frames_sent"] == 0
             samples = torch.frombuffer(raw, dtype=torch.float32).clone()
             options = (
                 ASRRequestOptions(
-                    enable_itn=False, enable_nmt=False,
+                    enable_itn=False,
+                    enable_nmt=False,
                     source_language=self._source_language,
                 )
-                if is_first else None
+                if is_first
+                else None
             )
             frame = Frame(
-                samples=samples, stream_id=session["int_id"],
-                is_first=is_first, is_last=False, options=options,
+                samples=samples,
+                stream_id=session["int_id"],
+                is_first=is_first,
+                is_last=False,
+                options=options,
             )
-            self._stream_pipeline.transcribe_step([frame])
+            outputs = self._stream_pipeline.transcribe_step([frame])
             session["frames_sent"] += 1
-            state = self._stream_pipeline.get_state(session["int_id"])
-            if state is not None:
-                flushed = getattr(state, 'final_transcript', '') or ''
+            if outputs:
+                flushed = outputs[0].final_transcript or ''
                 if flushed:
                     final_text = (final_text + " " + flushed).strip()
 
         if session["frames_sent"] > 0:
+            # is_last=True triggers forced finalization with keep_all_outputs=True;
+            # pipeline creates TranscribeStepOutput before cleanup and state deletion
             frame = Frame(
                 samples=torch.zeros(1, dtype=torch.float32),
                 stream_id=session["int_id"],
@@ -802,17 +910,14 @@ class GPUWorker:
                 is_last=True,
                 options=ASRRequestOptions(enable_itn=False, enable_nmt=False),
             )
-            self._stream_pipeline.transcribe_step([frame])
-            state = self._stream_pipeline.get_state(session["int_id"])
-            if state is not None:
-                remaining_final = getattr(state, 'final_transcript', '') or ''
-                remaining_partial = getattr(state, 'partial_transcript', '') or ''
+            outputs = self._stream_pipeline.transcribe_step([frame])
+            if outputs:
+                remaining_final = outputs[0].final_transcript or ''
+                remaining_partial = outputs[0].partial_transcript or ''
                 if remaining_final:
                     final_text = (final_text + " " + remaining_final).strip()
                 elif remaining_partial and not final_text:
                     final_text = remaining_partial.strip()
-
-            self._stream_pipeline.delete_state(session["int_id"])
 
         if not final_text and last_partial:
             final_text = last_partial

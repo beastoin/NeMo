@@ -1,7 +1,4 @@
 # Batch-only Parakeet TDT config — no streaming model loaded.
-# Saves ~2GB VRAM and avoids NeMo version dependency for streaming.
-#
-# Benchmarked: 49.6 RPS sustained on L4, 0 failures, 0% WER.
 
 server:
   host: "0.0.0.0"
@@ -13,9 +10,24 @@ batch_model:
   device: "cuda:0"
   compile: true
   amp: true
+  cuda_graphs: false
+
+  # Attention mode: "full" (default), "local", or "auto"
+  #   full  — O(T²) VRAM, max ~10min on L4. Best short-file throughput.
+  #   local — O(T×W) VRAM, max ~1h on L4. Slight WER increase, ~9% less throughput.
+  #   auto  — switches per-request based on audio duration (disables torch.compile).
+  attention_mode: "auto"
+  auto_local_attn_threshold_sec: 600
+  local_attn_context: [128, 128]
+
+  # Reject files longer than this (0 = no limit). Prevents OOM on L4:
+  #   full attention:  600 (10min)
+  #   local attention: 3600 (1h)
+  #   auto:            3600 (1h)
+  max_file_duration_sec: 3600
 
 batcher:
   max_batch_size: 32
   max_wait_seconds: 0.002
   max_queue_depth: 4096
-  max_upload_bytes: 104857600
+  max_upload_bytes: 536870912

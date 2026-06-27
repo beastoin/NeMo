@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nemo-asr-bench
+  namespace: dev-omi-backend
+  labels:
+    app: nemo-asr-bench
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 10
+  initContainers:
+    - name: setup
+      image: alpine/git:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -ex
+          cd /workspace
+          git clone --depth=1 --branch "${NEMO_FORK_BRANCH:-main}" "${NEMO_FORK:-https://github.com/beastoin/NeMo.git}" fork
+          cd fork
+          if [ -n "$NEMO_FORK_PR_BRANCH" ]; then
+            git fetch --depth=1 origin "$NEMO_FORK_PR_BRANCH"
+            git checkout FETCH_HEAD -- examples/asr/serving/
+          fi
+      env:
+        - name: NEMO_FORK
+          value: "https://github.com/beastoin/NeMo.git"
+        - name: NEMO_FORK_BRANCH
+          value: "main"
+        - name: NEMO_FORK_PR_BRANCH
+          value: ""
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      resources:
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+  containers:
+    - name: bench
+      image: nvcr.io/nvidia/nemo:26.02
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -ex
+
+          pip install --no-cache-dir --no-deps fastapi uvicorn[standard] python-multipart pyyaml 2>&1 | tail -3
+
+          # Copy fork source over base image nemo/ (init container already cloned)
+          rm -rf /opt/NeMo/nemo
+          cp -a /workspace/fork/nemo /opt/NeMo/nemo
+          pip install --no-deps -e /opt/NeMo 2>&1 | tail -3
+
+          MODE="${BENCH_MODE:-stream}"
+          cd /workspace/fork/examples/asr/serving
+
+          if [ "$MODE" = "batch" ]; then
+            # cuda_graphs crashes under high concurrency on L4 — disable for stability
+            cp conf/serving-batch.yaml conf/serving-batch-bench.yaml
+            sed -i 's/cuda_graphs:.*/cuda_graphs: false/' conf/serving-batch-bench.yaml
+            echo "Starting batch server (compile=true, cuda_graphs=false)..."
+            exec python server.py --config conf/serving-batch-bench.yaml --host 0.0.0.0 --port 8000
+          else
+            echo "Starting streaming server..."
+            exec python server.py --config conf/serving-stream.yaml --host 0.0.0.0 --port 8000
+          fi
+      ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+      env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: HF_HOME
+          value: "/model-cache"
+        - name: NUMBA_CACHE_DIR
+          value: "/tmp/numba_cache"
+        - name: PIP_NO_CACHE_DIR
+          value: "1"
+        - name: BENCH_MODE
+          value: "stream"
+      resources:
+        requests:
+          cpu: "2"
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "4"
+          memory: "26Gi"
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: model-cache
+          mountPath: /model-cache
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: workspace
+      emptyDir:
+        sizeLimit: 5Gi
+    - name: model-cache
+      emptyDir:
+        sizeLimit: 10Gi
+    - name: tmp
+      emptyDir:
+        sizeLimit: 5Gi
+  nodeSelector:
+    cloud.google.com/gke-nodepool: parakeet-pool
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
