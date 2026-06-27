@@ -59,7 +59,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 | cuda_graphs | **No** (crashes at c=32+) | N/A |
 | Zero failures | Yes | Yes |
 
-> **WER methodology:** Computed using [Whisper's EnglishTextNormalizer](https://github.com/jianfch/whisper-normalizer) — the industry standard for English ASR evaluation, also used by NVIDIA's NeMo speechlm2 metrics. Normalizes casing, punctuation, British/American spelling (honour→honor), contractions (it's→it is), and abbreviations (Mr.→mister) before comparison.
+> **WER methodology:** WER numbers in this README were measured on an L4 GPU pod using LibriSpeech test-clean samples with [Whisper's EnglishTextNormalizer](https://github.com/jianfch/whisper-normalizer) + [jiwer](https://github.com/jitsi/jiwer) corpus-level WER — the industry standard for English ASR evaluation, also used by NVIDIA's NeMo speechlm2 metrics. The included benchmark scripts (`stress_test.py --mode quality`, `stream_benchmark.py`) use espeak-ng TTS for quick validation; for reproducing the documented WER numbers, supply LibriSpeech test-clean audio.
 
 ## Architecture
 
