@@ -79,6 +79,12 @@ class GPUWorker:
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
+        self._attn_mode = "full"
+        self._attn_auto_threshold_sec = 600
+        self._attn_local_context = [128, 128]
+        self._attn_is_local = False
+        self._max_file_duration_sec = 0
+        self._raw_batch_model = None
 
     @property
     def is_ready(self) -> bool:
@@ -506,18 +512,38 @@ class GPUWorker:
         log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
         model = nemo_asr.models.ASRModel.from_pretrained(self._batch_cfg["name"], map_location=device)
         model.eval()
-        if self._batch_cfg.get("local_attn", False):
-            attn_ctx = self._batch_cfg.get("local_attn_context", [128, 128])
-            model.change_attention_model("rel_pos_local_attn", attn_ctx)
+
+        self._attn_mode = self._batch_cfg.get("attention_mode", "full")
+        self._attn_local_context = self._batch_cfg.get("local_attn_context", [128, 128])
+        self._attn_auto_threshold_sec = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
+        self._max_file_duration_sec = self._batch_cfg.get("max_file_duration_sec", 0)
+
+        if self._attn_mode == "local":
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
             model.change_subsampling_conv_chunking_factor(1)
-            log.info(f"Switched to local attention{tag} (context={attn_ctx}) — linear VRAM scaling")
+            self._attn_is_local = True
+            log.info(f"Attention mode: local{tag} (context={self._attn_local_context}) — linear VRAM scaling")
+        elif self._attn_mode == "auto":
+            log.info(
+                f"Attention mode: auto{tag} — full for <{self._attn_auto_threshold_sec}s, "
+                f"local for >={self._attn_auto_threshold_sec}s (torch.compile disabled for auto mode)"
+            )
+            self._raw_batch_model = model
+        else:
+            log.info(f"Attention mode: full{tag} (default)")
+
+        if self._max_file_duration_sec > 0:
+            log.info(f"Max file duration: {self._max_file_duration_sec}s")
+
         if not self._batch_cfg.get("cuda_graphs", True):
             if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
                 disabled = model.decoding.decoding.disable_cuda_graphs()
                 log.info(f"CUDA graph decoding disabled{tag} (was active: {disabled})")
-        if self._batch_cfg.get("compile", False):
+        if self._batch_cfg.get("compile", False) and self._attn_mode != "auto":
             log.info(f"Compiling batch model{tag} with torch.compile")
             model = torch.compile(model)
+        elif self._attn_mode == "auto" and self._batch_cfg.get("compile", False):
+            log.info(f"Skipping torch.compile{tag} — incompatible with auto attention switching")
         return model
 
     def _load_models(self) -> None:
@@ -644,11 +670,55 @@ class GPUWorker:
             raise RuntimeError("Batch model not loaded — server started in streaming-only mode")
         return self._batch_transcribe_with_model(self._batch_model, payload)
 
+    def _get_audio_duration_sec(self, path: str) -> float:
+        try:
+            import torchaudio
+            info = torchaudio.info(path)
+            return info.num_frames / info.sample_rate
+        except Exception:
+            return 0.0
+
+    def _switch_attention(self, to_local: bool) -> None:
+        if to_local == self._attn_is_local:
+            return
+        model = self._raw_batch_model
+        if model is None:
+            return
+        if to_local:
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            model.change_subsampling_conv_chunking_factor(1)
+            self._attn_is_local = True
+        else:
+            model.change_attention_model("rel_pos")
+            self._attn_is_local = False
+
     def _batch_transcribe_with_model(self, model, payload: dict) -> list:
         timestamps = payload.get("timestamps", False)
         batch_size = payload.get("batch_size", 16)
 
         audio_input = payload.get("audio_tensors", payload["audio_paths"])
+
+        if self._max_file_duration_sec > 0 and isinstance(audio_input, list):
+            for path in audio_input:
+                if isinstance(path, str):
+                    dur = self._get_audio_duration_sec(path)
+                    if dur > self._max_file_duration_sec:
+                        raise RuntimeError(
+                            f"Audio file {dur:.0f}s exceeds max_file_duration_sec "
+                            f"({self._max_file_duration_sec}s). Use shorter files or "
+                            f"set attention_mode: local/auto for longer audio."
+                        )
+
+        if self._attn_mode == "auto" and isinstance(audio_input, list):
+            max_dur = max(
+                (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
+                default=0.0,
+            )
+            need_local = max_dur >= self._attn_auto_threshold_sec
+            if need_local != self._attn_is_local:
+                mode_name = "local" if need_local else "full"
+                log.info(f"Auto-switching attention to {mode_name} (longest file: {max_dur:.0f}s)")
+                self._switch_attention(need_local)
 
         results = model.transcribe(
             audio_input,
