@@ -2,8 +2,8 @@
 
 High-performance ASR inference server for NVIDIA NeMo models. Two modes on a single GPU:
 
-- **Batch** (REST API) — Parakeet TDT 0.6B for offline transcription, dynamically batched, 343x realtime on L4
-- **Streaming** (WebSocket) — Nemotron 3.5 ASR Streaming 0.6B for real-time transcription, 56 concurrent streams on L4
+- **Batch** (REST API) — Parakeet TDT 0.6B for offline transcription, dynamically batched, 136x realtime on L4
+- **Streaming** (WebSocket) — Nemotron 3.5 ASR Streaming 0.6B for real-time transcription, 128 concurrent streams on L4
 
 Deploy either mode independently or both together. Production-tested with [Omi](https://github.com/BasedHardware/omi), an open-source AI wearable processing thousands of concurrent audio streams.
 
@@ -11,21 +11,23 @@ Deploy either mode independently or both together. Production-tested with [Omi](
 
 ### Batch Mode (Parakeet TDT 0.6B)
 
-| GPU | Sustained RPS | Realtime | RTF | torch.compile | Failures | Daily Capacity |
-|-----|:------------:|:--------:|:---:|:-------------:|:--------:|:--------------:|
-| **L4** (24GB) | **43** | **343x** | **0.003** | Yes | 0 | 3.7M req |
-| **T4** (16GB) | **6.9** | **55x** | **0.018** | Yes | 0 | 596K req |
+All benchmarks use real LibriSpeech test-clean speech audio, not silence or TTS.
+
+| GPU | Peak RPS | RTFx | torch.compile | cuda_graphs | Failures |
+|-----|:--------:|:----:|:-------------:|:-----------:|:--------:|
+| **L4** (24GB) | **15.0** (c=256) | **136x** | Yes | **No** (crashes at c=32+) | 0 |
+| **T4** (16GB) | **6.9** | **55x** | Yes | **No** (crashes on Turing) | 0 |
 
 ### Streaming Mode (Nemotron 3.5 ASR Streaming 0.6B)
 
-| GPU | Max Concurrent | WER (LibriSpeech) | p99 Latency | Throughput | Failures |
-|-----|:--------------:|:-----------------:|:-----------:|:----------:|:--------:|
-| **L4** (24GB) | **c=56** | **6.9%** | **2.8s** | **129 sess/min** | 0 |
+| GPU | Max Concurrent | WER (LibriSpeech) | Peak Throughput | Failures |
+|-----|:--------------:|:-----------------:|:---------------:|:--------:|
+| **L4** (24GB) | **c=128** | **7.5%** | **65.1 sess/min** | 0 |
 
 **What the numbers mean:**
-- **343x realtime** (RTF 0.003) means one L4 GPU transcribes 343 seconds of audio per wall-clock second
-- **c=56** means 56 users can stream audio simultaneously to a single GPU with no quality degradation
-- **WER 6.9%** on LibriSpeech test-clean — production-grade accuracy under full concurrent load
+- **136x realtime** means one L4 GPU transcribes 136 seconds of audio per wall-clock second at peak load
+- **c=128** means 128 users can stream audio simultaneously to a single GPU with no quality degradation
+- **WER 7.5%** on LibriSpeech test-clean — production-grade accuracy under full concurrent load
 
 All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CUDA 12.8), zero failures.
 
@@ -38,6 +40,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 | Partial transcripts | N/A | **Yes** | Per-chunk partial + final |
 | Punctuation & capitalization | **Yes** | **Yes** | Built into model output |
 | Multilingual | No | **Yes** | Prompt-conditioned language selection |
+| Long audio (>10min) | **Yes** | N/A | Via local attention mode (up to 1h on L4) |
 | ITN (inverse text normalization) | No | No | Supported by models, not yet exposed |
 | Diarization | No | No | Requires separate model (e.g. pyannote) |
 | Confidence scores | No | No | |
@@ -47,14 +50,16 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 
 | Metric | Batch | Streaming |
 |--------|:-----:|:---------:|
-| WER (LibriSpeech) | ~3-5% | 6.9% |
-| RTFx | 343x | N/A (realtime-paced) |
-| RTF | 0.003 | N/A |
-| Max throughput | 43 RPS | c=56 (129 sess/min) |
-| p99 latency | ~2.7s | 2.8s |
+| WER (LibriSpeech) | 14.0% | 7.5% |
+| RTFx (peak) | 136x | N/A (realtime-paced) |
+| Max throughput | 15.0 RPS (c=256) | 65.1 sess/min (c=128) |
+| Max tested (0 failures) | c=512 | c=256 |
 | VRAM | ~4 GB | ~5.7 GB |
 | torch.compile | Yes (+20-30%) | No benefit |
+| cuda_graphs | **No** (crashes at c=32+) | N/A |
 | Zero failures | Yes | Yes |
+
+> **Note on batch WER:** The 14.0% figure includes punctuation in Parakeet TDT output vs unpunctuated LibriSpeech references. Actual word accuracy is higher — the mismatch is scoring methodology, not model quality.
 
 ## Architecture
 
@@ -78,7 +83,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
           │  Flushes at:        │                      │  Routes PCM16 chunks    │
           │  • batch_size=32    │                      │  to GPU worker.         │
           │  • wait=2ms         │                      │  Backpressure: 503      │
-          │  Backpressure: 503  │                      │  at 128 streams.        │
+          │  Backpressure: 503  │                      │  at stream limit.       │
           └────────┬────────────┘                      └────────────┬────────────┘
                    │                                                │
                    └──────────────┐          ┌──────────────────────┘
@@ -90,6 +95,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
                           │  • torch.inference_mode()                     │
                           │  • gc.collect(0) per batch, full gc/50        │
                           │  • All CUDA state on one thread               │
+                          │  • Auto attention switching (full/local)      │
                           └──────┬────────────────────────┬──────────────┘
                                  │                        │
                                  ▼                        ▼
@@ -102,7 +108,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 
 **Why a single GPU thread?** NeMo models hold CUDA state that is not thread-safe. A dedicated thread avoids CUDA context contention, prevents cross-thread tensor GC segfaults, and gives predictable latency. The async server handles I/O concurrency while the GPU thread handles compute.
 
-**Why dynamic batching?** Individual requests arrive at random times. Without batching, each request runs alone on the GPU. The batch engine collects requests and flushes them as one GPU batch (1 RPS serial vs 43 RPS batched on L4).
+**Why dynamic batching?** Individual requests arrive at random times. Without batching, each request runs alone on the GPU. The batch engine collects requests and flushes them as one GPU batch (1 RPS serial vs 15 RPS batched on L4).
 
 **Why chunk accumulation for streaming?** Clients send small audio chunks (e.g. 40ms) over WebSocket. The streaming model expects 320ms chunks matching its training chunk size. The GPU worker accumulates small chunks per stream and processes them when 320ms of audio is buffered, which is required for multilingual models to produce non-blank output.
 
@@ -328,6 +334,11 @@ curl -F file=@audio.wav "http://localhost:8000/v1/transcribe?timestamps=true"
 }
 ```
 
+Files exceeding `max_file_duration_sec` return HTTP 413:
+```json
+{"detail": "Audio file 10800s exceeds max_file_duration_sec (3600s). Use shorter files or set attention_mode: local/auto for longer audio."}
+```
+
 ### POST /v1/transcribe/batch
 
 Transcribe up to 64 files in a single request. All files are batched together for maximum GPU utilization.
@@ -341,7 +352,7 @@ curl -F files=@audio1.wav -F files=@audio2.wav -F files=@audio3.wav \
 {"results": [{"text": "...", "audio_path": "..."}, {"text": "...", "audio_path": "..."}, ...]}
 ```
 
-Max file size: 100MB (configurable via `max_upload_bytes`).
+Max file size: 512MB (configurable via `max_upload_bytes`).
 
 ### GET /health
 
@@ -439,15 +450,66 @@ batch_model:
   name: "nvidia/parakeet-tdt-0.6b-v3"
   device: "cuda:0"
   compile: true                 # +20-30% throughput, ~60s warmup
-  amp: true                     # Automatic mixed precision
-  cuda_graphs: true             # RNNT decoder CUDA graphs (disable on T4)
+  amp: true                     # Currently inert in code (no autocast wrapper)
+  cuda_graphs: false            # MUST be false — crashes at c=32+ on both L4 and T4
+
+  # Attention mode for long audio support (see "Attention Modes" below)
+  attention_mode: "auto"               # "full", "local", or "auto"
+  auto_local_attn_threshold_sec: 600   # Switch to local attention above 10min
+  local_attn_context: [128, 128]       # Local attention window size
+  max_file_duration_sec: 3600          # Reject files longer than 1h (HTTP 413)
 
 batcher:
   max_batch_size: 32            # Optimal with torch.compile
   max_wait_seconds: 0.002       # Near-instant flush
   max_queue_depth: 4096         # Burst absorption buffer
-  max_upload_bytes: 104857600   # 100MB max per file
+  max_upload_bytes: 536870912   # 512MB max per file
 ```
+
+### Attention Modes
+
+The FastConformer encoder in Parakeet TDT uses full self-attention by default, which scales O(T²) with audio duration. On L4 (22GB usable VRAM), this limits single-file inference to ~10 minutes before OOM.
+
+Three attention modes are available:
+
+| Mode | torch.compile | Max Duration (L4) | WER Impact | Throughput | Use Case |
+|------|:-------------:|:-----------------:|:----------:|:----------:|----------|
+| `full` | Yes | ~10min | Baseline | **136x RTFx** | Short files only, max throughput |
+| `local` | Yes | ~1h | +0.7% | **124x RTFx** (-9%) | Long-file-only workloads |
+| `auto` | No | ~1h | Per-request | ~124x when local | Mixed audio lengths (recommended) |
+
+**`full`** — Default O(T²) attention. Best throughput for short files. OOMs above ~10min on L4.
+
+**`local`** — Switches to `rel_pos_local_attn` with a sliding window (`local_attn_context`). O(T×W) VRAM scaling — handles up to 1h on L4. Also applies `change_subsampling_conv_chunking_factor(1)` to chunk conv layers.
+
+**`auto`** — Switches between full and local attention per-request based on the longest file in each batch. Files shorter than `auto_local_attn_threshold_sec` use full attention; longer files trigger a switch to local. Disables torch.compile (compiled graphs freeze the attention pattern).
+
+#### Audio Duration vs Performance (L4, batch c=1)
+
+| Duration | Attention | RTFx | Latency | VRAM |
+|:--------:|:---------:|:----:|:-------:|:----:|
+| 30s | full | 48x | 0.62s | ~5.2GB |
+| 60s | full | 59x | 1.01s | ~5.3GB |
+| 5min | full | 55x | 5.45s | ~6.4GB |
+| 10min | full | 48x | 12.43s | ~19GB |
+| 11min | full | OOM | — | ~23.5GB needed |
+| 30min | local | 78x | 23.2s | ~5.6GB |
+| 1h | local | 75x | 48.0s | ~9.3GB |
+| 75min+ | local | OOM | — | >22GB needed |
+
+> Local attention is actually faster than full attention for files ≥5min because O(T×W) < O(T²). RTFx improves with duration under local attention.
+
+#### Configuration
+
+```yaml
+batch_model:
+  attention_mode: "auto"               # "full" | "local" | "auto"
+  auto_local_attn_threshold_sec: 600   # auto mode: switch to local above this (seconds)
+  local_attn_context: [128, 128]       # local attention window [left, right]
+  max_file_duration_sec: 3600          # reject files longer than this (0 = no limit)
+```
+
+**Production recommendation:** Use `attention_mode: "auto"` with `max_file_duration_sec: 3600` for mixed workloads. This handles files from seconds to 1 hour on a single L4. For short-file-only workloads (<10min), use `attention_mode: "full"` with `compile: true` for maximum throughput.
 
 ### Tuning Guide
 
@@ -462,15 +524,15 @@ batcher:
 
 **`source_language`** (streaming): The Nemotron 3.5 ASR Streaming model supports multiple languages. Set this to match the expected input language. The model uses a 128-dim one-hot prompt vector to condition on language. The prompt is set once on the first audio frame of each stream.
 
-**`max_batch_size`** (batch): With torch.compile, `32` outperforms `96` because smaller batches cycle through compiled CUDA kernels faster. Without torch.compile (T4), try `64-96` for better GPU utilization.
+**`max_batch_size`** (batch): With torch.compile, `32` outperforms `64` because smaller batches cycle through compiled CUDA kernels faster. Without torch.compile (T4), try `64-96` for better GPU utilization.
 
 **`max_wait_seconds`** (batch): Keep at `0.002` (2ms). The default `0.1` wastes GPU time idle-waiting. Under load, batches fill before the timer fires anyway.
 
 **`max_queue_depth`** (batch): Keep at `4096`. In load testing, `256` caused cascading 503 failures during traffic bursts. The deep queue absorbs spikes while the GPU catches up.
 
-**`torch.compile`** (batch): Fuses GPU kernels for 20-30% throughput gain. Works on L4 and T4. The streaming model does not benefit from torch.compile due to cache-aware state management.
+**`torch.compile`** (batch): Fuses GPU kernels for 20-30% throughput gain. Works on L4 and T4. Requires ~60s warmup and 5Gi+ /tmp for kernel cache. The streaming model does not benefit from torch.compile due to cache-aware state management. Incompatible with `attention_mode: "auto"` (compiled graphs freeze the attention pattern).
 
-**`cuda_graphs`** (batch): NeMo's RNNT decoder uses CUDA Graph conditional nodes. These work on Ada Lovelace+ (L4, A100) but cause `cudaErrorIllegalAddress` on Turing (T4, compute capability 7.5). **Set `cuda_graphs: false` for T4 deployments.**
+**`cuda_graphs`** (batch): **Must be `false` for production.** NeMo's RNNT decoder uses CUDA Graph conditional nodes that cause `cudaErrorIllegalAddress` at c=32+ on both L4 and T4 under concurrent batch flushes. Throughput impact of disabling is minimal (~5%).
 
 **`prefetch`** (batch): Pre-reads audio files on a background thread and passes tensors directly to `model.transcribe()`, bypassing NeMo's DataLoader overhead. Gives **+7% throughput and -24% latency** on T4.
 
@@ -486,23 +548,27 @@ The included `k8s/hpa.yaml` auto-scales 1-4 batch replicas based on CPU utilizat
 
 | Replicas | Batch RPS (L4) | Concurrent Streams (L4) |
 |:--------:|:--------------:|:-----------------------:|
-| 1 | 43 | 56 |
-| 2 | ~86 | ~112 |
-| 4 | ~172 | ~224 |
+| 1 | 15 | 128 |
+| 2 | ~30 | ~256 |
+| 4 | ~60 | ~512 |
 
 ### GPU Selection
 
-| GPU | VRAM | Batch RPS | Stream Max c | torch.compile | CUDA Graphs | Best For |
-|-----|:----:|:---------:|:------------:|:-------------:|:-----------:|----------|
-| **L4** | 24GB | 43 | 56 | Yes | Yes | Production |
-| **T4** | 16GB | 6.9 | — | Yes | No | Dev/staging |
-| A100 | 80GB | ~100+ | ~100+ | Yes | Yes | Maximum throughput |
+| GPU | VRAM | Batch Peak RPS | Stream Max c | torch.compile | cuda_graphs | Best For |
+|-----|:----:|:--------------:|:------------:|:-------------:|:-----------:|----------|
+| **L4** | 24GB | 15.0 | 128 | Yes | **No** | Production |
+| **T4** | 16GB | 6.9 | — | Yes | **No** | Dev/staging |
+| A100 | 80GB | ~40+ | ~200+ | Yes | Yes | Maximum throughput |
+
+> cuda_graphs crashes on both L4 and T4 under concurrent load. Only A100+ is untested but expected to work.
 
 ### Deployment Patterns
 
-**Real-time product (Omi-like):** Deploy streaming-only (`Dockerfile.stream` + `serving-stream.yaml`) on L4 GPUs. One L4 handles 56 concurrent users. Scale horizontally with a WebSocket-aware load balancer (e.g. Nginx with `proxy_pass` and `Upgrade` headers, or a GKE ingress with WebSocket support).
+**Real-time product (Omi-like):** Deploy streaming-only (`Dockerfile.stream` + `serving-stream.yaml`) on L4 GPUs. One L4 handles 128 concurrent users. Scale horizontally with a WebSocket-aware load balancer (e.g. Nginx with `proxy_pass` and `Upgrade` headers, or a GKE ingress with WebSocket support).
 
 **Offline transcription:** Deploy batch-only (`Dockerfile.batch` + `serving-batch.yaml`) on L4 GPUs. HPA scales based on queue depth or CPU. Model cache PVC avoids re-download on pod restart.
+
+**Mixed audio lengths:** Use `attention_mode: "auto"` in batch config. Short files (<10min) get full attention for maximum throughput; long files (10min-1h) automatically switch to local attention. Files over `max_file_duration_sec` are rejected with HTTP 413 — chunk client-side for longer audio.
 
 **Hybrid:** Deploy both models on a single L4 (`serving.yaml`). Uses ~10GB of 24GB VRAM. Useful when you need both real-time and offline transcription and want to minimize infrastructure.
 
@@ -522,7 +588,7 @@ python stream_benchmark.py --server ws://localhost:8000 --concurrency 1,4,16,32
 python stream_benchmark.py --server ws://localhost:8000 --sustained-minutes 5
 
 # Full concurrency sweep:
-python stream_benchmark.py --server ws://localhost:8000 --concurrency 1,2,4,8,16,32,48,56,64
+python stream_benchmark.py --server ws://localhost:8000 --concurrency 1,2,4,8,16,32,64,128
 ```
 
 ### Batch Benchmark
@@ -545,7 +611,7 @@ python stress_test.py --server http://localhost:8000 --mode mixed
 
 ### Full Performance Characterization
 
-Warmup, concurrency sweep (1-128), audio duration sweep (1s-60s), and sustained load test:
+Warmup, concurrency sweep (1-512), audio duration sweep (1s-60s), and sustained load test:
 
 ```bash
 python benchmark.py --server http://localhost:8000 --sustained-minutes 5 --output report.json
@@ -582,8 +648,8 @@ docker build -f examples/asr/serving/Dockerfile        -t nemo-asr-serving .
 
 ```
 examples/asr/serving/
-  server.py                # FastAPI server — REST + WebSocket endpoints, health/metrics
-  gpu_worker.py            # Dedicated GPU inference thread — batch + streaming dispatch
+  server.py                # FastAPI server — REST + WebSocket endpoints, health/metrics, HTTP 413 for over-limit files
+  gpu_worker.py            # Dedicated GPU inference thread — batch + streaming dispatch, attention mode switching
   batch_engine.py          # Dynamic batching engine for offline transcription
   stream_engine.py         # Streaming session manager — lifecycle + chunk routing
   stress_test.py           # Batch/stream/mixed/quality test client
@@ -595,7 +661,7 @@ examples/asr/serving/
   conf/
     serving.yaml            # Combined batch + streaming config
     serving-stream.yaml     # Streaming-only config (L4)
-    serving-batch.yaml      # Batch-only config (L4)
+    serving-batch.yaml      # Batch-only config (L4) — includes attention mode and duration limits
     serving-batch-t4.yaml   # Batch-only config (T4)
 
   Dockerfile               # Combined batch + streaming image
@@ -608,51 +674,52 @@ examples/asr/serving/
     deployment-stream.yaml  # L4 streaming deployment + model cache PVC
     deployment-t4.yaml      # T4 batch deployment
     deployment-t4-bench.yaml # T4 benchmark deployment
+    benchmark-pod-l4.yaml   # L4 benchmark pod with init container pattern
     service.yaml            # ClusterIP service
     hpa.yaml                # Horizontal Pod Autoscaler (1-4 replicas)
     benchmark-job.yaml      # In-cluster benchmark job
     benchmark-configs.yaml  # Benchmark configuration sweep job
 ```
 
-## Thread-Safety Fixes
+## Thread-Safety & Inference Fixes
 
-This server addresses five issues in NeMo's inference path that cause crashes under concurrent load:
+This server addresses six issues in NeMo's inference path that cause crashes or incorrect results under concurrent load:
 
-1. **Streaming prompt_vectors dropped** — NeMo's `execute_step()` in the cache-aware RNNT wrapper silently drops `prompt_vectors` when processing streaming frames. Multilingual models (like Nemotron 3.5 ASR Streaming) require these vectors for language conditioning. Without them, the model produces blank or garbled output. Fixed by projecting `prompt_vectors` through the model's `prompt_kernel` MLP in the streaming path.
+1. **EOU events silently lost** — The upstream pipeline's `transcribe_step()` creates `TranscribeStepOutput` from state, then calls `cleanup_after_response()` which clears `final_transcript`. Our code called `get_state()` after `transcribe_step()`, so `final_transcript` was always empty. End-of-utterance events were silently lost and transcription relied entirely on partial fallback. Fixed by using `TranscribeStepOutput` return values directly.
 
-2. **Mel spectrogram fragmentation** — Small WebSocket chunks (e.g. 40ms) produce fragmented mel spectrograms when processed individually. The cache-aware RNNT pipeline expects chunks matching its training chunk size (320ms / 5120 samples at 16kHz). Fixed by accumulating client audio chunks per stream and only creating frames when the native chunk size is reached. The chunk size is read from `pipeline.chunk_size_in_secs * pipeline.sample_rate`.
+2. **Streaming prompt_vectors dropped** — NeMo's `execute_step()` in the cache-aware RNNT wrapper silently drops `prompt_vectors` when processing streaming frames. Multilingual models (like Nemotron 3.5 ASR Streaming) require these vectors for language conditioning. Without them, the model produces blank or garbled output. Fixed by projecting `prompt_vectors` through the model's `prompt_kernel` MLP in the streaming path.
 
-3. **CUDA Graph crash on Turing GPUs** — NeMo's RNNT decoder uses CUDA Graph conditional nodes compiled via NVRTC. These cause `cudaErrorIllegalAddress` on T4 (Turing, compute capability 7.5), poisoning the CUDA context. Fixed by adding a `cuda_graphs: false` config option. L4/A100+ are unaffected.
+3. **Mel spectrogram fragmentation** — Small WebSocket chunks (e.g. 40ms) produce fragmented mel spectrograms when processed individually. The cache-aware RNNT pipeline expects chunks matching its training chunk size (320ms / 5120 samples at 16kHz). Fixed by accumulating client audio chunks per stream and only creating frames when the native chunk size is reached. The chunk size is read from `pipeline.chunk_size_in_secs * pipeline.sample_rate`.
 
-4. **freeze/unfreeze race** (#15771) — Concurrent `transcribe()` calls crash on `_frozen_grad_map`. Fixed by removing redundant freeze/unfreeze (covered by `@torch.inference_mode()`).
+4. **CUDA Graph crash under concurrent load** — NeMo's RNNT decoder uses CUDA Graph conditional nodes compiled via NVRTC. These cause `cudaErrorIllegalAddress` at c=32+ on both L4 and T4, poisoning the CUDA context. Previously thought to be T4-only — confirmed on L4 during benchmarking. Fixed by setting `cuda_graphs: false` in config.
 
-5. **Cross-thread CUDA tensor GC** — NeMo's RNNT decoder holds CUDA pinned-memory tensors. When garbage-collected on the async event-loop thread instead of the GPU thread, `CachingHostAllocator` segfaults (signal 139). Fixed by: (a) serializing results to plain Python dicts on the GPU thread before returning, (b) disabling automatic GC (`gc.disable()`) and running `gc.collect(0)` on the GPU thread after every batch.
+5. **freeze/unfreeze race** (#15771) — Concurrent `transcribe()` calls crash on `_frozen_grad_map`. Fixed by removing redundant freeze/unfreeze (covered by `@torch.inference_mode()`).
+
+6. **Cross-thread CUDA tensor GC** — NeMo's RNNT decoder holds CUDA pinned-memory tensors. When garbage-collected on the async event-loop thread instead of the GPU thread, `CachingHostAllocator` segfaults (signal 139). Fixed by: (a) serializing results to plain Python dicts on the GPU thread before returning, (b) disabling automatic GC (`gc.disable()`) and running `gc.collect(0)` on the GPU thread after every batch.
 
 ## Case Study: Omi (AI Wearable)
 
 [Omi](https://github.com/BasedHardware/omi) is an open-source AI wearable that captures conversations and transcribes them in real time. Their backend processes thousands of audio segments from concurrent users.
 
-**Problem:** NeMo's `model.transcribe()` crashed under concurrent requests — CUDA segfaults from cross-thread tensor GC, freeze/unfreeze races, and CUDA Graph incompatibilities. The service was unstable above 2-3 concurrent users.
+**Problem:** NeMo's `model.transcribe()` crashed under concurrent requests — CUDA segfaults from cross-thread tensor GC, freeze/unfreeze races, and CUDA Graph incompatibilities. Streaming transcription silently dropped end-of-utterance events.
 
-**Solution:** Deployed this serving stack on GKE with the NGC 26.02 container and NeMo thread-safety patches.
+**Solution:** Deployed this serving stack on GKE with the NGC 26.02 container and NeMo inference fixes.
 
-**Batch results** (L4 GPU, torch.compile + CUDA Graphs):
+**Batch results** (L4 GPU, torch.compile, cuda_graphs=false):
 
 | Metric | Value |
 |--------|-------|
-| Sustained RPS | **35.92** |
-| Realtime | **286x** (RTF 0.003) |
-| Total requests tested | 5,134 |
-| Failures | **0** |
+| Peak RPS | **15.0** (c=256) |
+| RTFx | **136x** |
+| Max tested concurrency | c=512 (0 failures) |
 
 **Streaming results** (L4 GPU, Nemotron 3.5 ASR Streaming 0.6B):
 
 | Metric | Value |
 |--------|-------|
-| Max concurrent streams | **c=56** |
-| WER (LibriSpeech) | **6.9%** |
-| p99 latency | **2.8s** |
-| Throughput | **129 sessions/min** |
+| Max concurrent streams | **c=128** |
+| WER (LibriSpeech) | **7.5%** |
+| Peak throughput | **65.1 sessions/min** |
 | Failures | **0** |
 
 **Key deployment choices:**
@@ -661,13 +728,20 @@ This server addresses five issues in NeMo's inference path that cause crashes un
 - All models loaded on the GPU worker thread (not the main thread) to prevent cross-thread CUDA tensor ownership crashes
 - `gc.disable()` at module level + `gc.collect(0)` per batch on GPU thread
 - Client audio chunks (40ms) accumulated to model's native 320ms before inference
+- `cuda_graphs: false` to prevent crashes at c=32+
+- `attention_mode: "auto"` for handling mixed audio durations (seconds to 1 hour)
 
 ## Known Limitations
 
 - **Single GPU per instance.** Scale horizontally for more throughput.
+- **cuda_graphs must be false.** Crashes at c=32+ on both L4 and T4 under concurrent batch flushes. Impact is minimal (~5% throughput).
+- **Full attention max ~10min on L4.** VRAM scales O(T²) with audio duration. Use `attention_mode: "local"` or `"auto"` for longer files.
+- **Local attention max ~1h on L4.** Conv/mel layers still require significant VRAM at extreme durations. Files over 75min OOM even with local attention on L4.
+- **Auto mode disables torch.compile.** Compiled CUDA graphs freeze the attention pattern, preventing per-request switching. Use `full` or `local` mode to keep torch.compile.
 - **T4 streaming not benchmarked.** T4's 16GB VRAM is tight for the streaming model (~5.7GB) plus batch model (~4GB). Streaming-only on T4 should work but is not production-tested.
-- **T4 requires `cuda_graphs: false`** for batch mode. CUDA Graph conditional nodes in the RNNT decoder crash on Turing architecture. Throughput impact is minor (~5%).
-- **torch.compile warmup.** First batch inference takes ~60s for kernel compilation. K8s `startupProbe` handles this gracefully.
+- **torch.compile warmup.** First batch inference takes ~60s for kernel compilation. K8s `startupProbe` handles this gracefully. Needs 5Gi+ /tmp for kernel cache.
 - **workers=1 required.** GPU models are not fork-safe. Do not set `workers > 1`.
 - **Idle stream reaping.** Streams that stop sending audio are closed after `idle_timeout` (default 5 min). Set `max_stream_duration` > 0 to also enforce a hard time cap.
 - **No TLS/auth built in.** Deploy behind a reverse proxy (Nginx, Envoy, GKE Ingress) for TLS termination and authentication.
+- **batch_model.amp is inert.** The config option exists but no autocast wrapper is applied in `_batch_transcribe_with_model`. Implementing it with torch.compile causes 43% throughput regression due to graph breaks.
+- **stream_model.compile is inert.** The code ignores this flag. Cache-aware RNNT has dynamic state that doesn't benefit from torch.compile.
