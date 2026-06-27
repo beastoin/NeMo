@@ -353,6 +353,8 @@ async def quality_test(server: str) -> dict:
 
     log.info(f"Testing {len(samples)} audio samples")
     results = []
+    corpus_refs = []
+    corpus_hyps = []
 
     async with aiohttp.ClientSession() as session:
         for sample in samples:
@@ -396,11 +398,14 @@ async def quality_test(server: str) -> dict:
                         entry["wer"] = round(wer, 4)
                         entry["ref_words"] = len(reference.split())
                         entry["reference"] = reference[:100]
+                        corpus_refs.append(reference)
+                        corpus_hyps.append(hypothesis)
                         log.info(f"  {sample['name']}: WER={wer:.1%} latency={latency:.1f}s")
                     else:
                         expected = sample.get("expected_words", [])
                         min_words = sample.get("min_words", 3)
-                        hyp_words = hypothesis.split()
+                        hyp_lower = hypothesis.lower()
+                        hyp_words = hyp_lower.split()
                         matched = [w for w in expected if w in hyp_words]
                         entry["expected_words_matched"] = f"{len(matched)}/{len(expected)}"
                         entry["word_count_ok"] = len(hyp_words) >= min_words
@@ -420,12 +425,10 @@ async def quality_test(server: str) -> dict:
     avg_latency = sum(r["latency_ms"] for r in ok_results) / len(ok_results) if ok_results else None
 
     corpus_wer_val = None
-    if tts_results:
+    if corpus_refs:
         from wer_utils import corpus_wer
 
-        tts_refs = [r["reference"] for r in tts_results]
-        tts_hyps = [r["hypothesis"] for r in tts_results]
-        corpus_wer_val = round(corpus_wer(tts_refs, tts_hyps), 4)
+        corpus_wer_val = round(corpus_wer(corpus_refs, corpus_hyps), 4)
 
     return {
         "test": "quality",
