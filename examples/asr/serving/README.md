@@ -50,7 +50,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 
 | Metric | Batch | Streaming |
 |--------|:-----:|:---------:|
-| WER (LibriSpeech) | 2.0% | 7.5% |
+| WER (LibriSpeech) | 1.8% | 7.5% |
 | RTFx (peak) | 136x | N/A (realtime-paced) |
 | Max throughput | 15.0 RPS (c=256) | 65.1 sess/min (c=128) |
 | Max tested (0 failures) | c=512 | c=256 |
