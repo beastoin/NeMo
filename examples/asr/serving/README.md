@@ -11,11 +11,11 @@ Deploy either mode independently or both together. Production-tested with [Omi](
 
 ### Batch Mode (Parakeet TDT 0.6B)
 
-Throughput measured with real speech audio (espeak-ng TTS); WER measured on LibriSpeech test-clean.
+All benchmarks use LibriSpeech test-clean audio (avg 9.1s per sample).
 
 | GPU | Peak RPS | RTFx | torch.compile | cuda_graphs | Failures |
 |-----|:--------:|:----:|:-------------:|:-----------:|:--------:|
-| **L4** (24GB) | **15.0** (c=256) | **136x** | Yes | **No** (crashes at c=32+) | 0 |
+| **L4** (24GB) | **19.5** (c=256) | **178x** | Yes | **No** (crashes at c=32+) | 0 |
 | **T4** (16GB) | **6.9** | **55x** | Yes | **No** (crashes on Turing) | 0 |
 
 ### Streaming Mode (Nemotron 3.5 ASR Streaming 0.6B)
@@ -25,7 +25,7 @@ Throughput measured with real speech audio (espeak-ng TTS); WER measured on Libr
 | **L4** (24GB) | **c=128** | **7.5%** | **65.1 sess/min** | 0 |
 
 **What the numbers mean:**
-- **136x realtime** means one L4 GPU transcribes 136 seconds of audio per wall-clock second at peak load
+- **178x realtime** means one L4 GPU transcribes 178 seconds of audio per wall-clock second at peak load
 - **c=128** means 128 users can stream audio simultaneously to a single GPU with no quality degradation
 - **WER 7.5%** on LibriSpeech test-clean — production-grade accuracy under full concurrent load
 
@@ -51,15 +51,27 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 | Metric | Batch | Streaming |
 |--------|:-----:|:---------:|
 | WER (LibriSpeech) | 1.8% | 7.5% |
-| RTFx (peak) | 136x | N/A (realtime-paced) |
-| Max throughput | 15.0 RPS (c=256) | 65.1 sess/min (c=128) |
+| RTFx (peak) | 178x | N/A (realtime-paced) |
+| Max throughput | 19.5 RPS (c=256) | 65.1 sess/min (c=128) |
 | Max tested (0 failures) | c=512 | c=256 |
 | VRAM | ~4 GB | ~5.7 GB |
 | torch.compile | Yes (+20-30%) | No benefit |
 | cuda_graphs | **No** (crashes at c=32+) | N/A |
 | Zero failures | Yes | Yes |
 
-> **WER methodology:** WER numbers in this README were measured on an L4 GPU pod using LibriSpeech test-clean samples with [Whisper's EnglishTextNormalizer](https://github.com/jianfch/whisper-normalizer) + [jiwer](https://github.com/jitsi/jiwer) corpus-level WER — the industry standard for English ASR evaluation, also used by NVIDIA's NeMo speechlm2 metrics. The included benchmark scripts (`stress_test.py --mode quality`, `stream_benchmark.py`) use espeak-ng TTS for quick validation; for reproducing the documented WER numbers, supply LibriSpeech test-clean audio.
+> **Benchmark methodology:** All throughput (RPS, RTFx) and WER numbers use LibriSpeech test-clean audio (avg 9.1s per sample). RTFx = total_audio_seconds / wall_clock_seconds, measured end-to-end through the HTTP serving stack. WER uses [Whisper's EnglishTextNormalizer](https://github.com/jianfch/whisper-normalizer) + [jiwer](https://github.com/jitsi/jiwer) corpus-level WER — the industry standard for English ASR evaluation, also used by NVIDIA's NeMo speechlm2 metrics. The included benchmark scripts (`stress_test.py --mode quality`, `stream_benchmark.py`) use espeak-ng TTS for quick validation; for reproducing the documented numbers, supply LibriSpeech test-clean audio.
+
+#### Batch Concurrency Sweep (L4, LibriSpeech test-clean, full attention + torch.compile)
+
+| Concurrency | RPS | RTFx | Failures | p50 | p99 |
+|:-----------:|:---:|:----:|:--------:|:---:|:---:|
+| c=1 | 1.4 | 13x | 0 | 711ms | 1462ms |
+| c=8 | 7.7 | 70x | 0 | 959ms | 2172ms |
+| c=32 | 13.5 | 118x | 0 | 2207ms | 2608ms |
+| c=64 | 14.1 | 124x | 0 | 4418ms | 5282ms |
+| c=128 | 14.4 | 131x | 0 | 8646ms | 11864ms |
+| c=256 | 19.5 | 178x | 0 | 10229ms | 13986ms |
+| c=512 | 19.2 | 175x | 0 | 10615ms | 20784ms |
 
 ## Architecture
 
@@ -474,9 +486,9 @@ Three attention modes are available:
 
 | Mode | torch.compile | Max Duration (L4) | WER Impact | Throughput | Use Case |
 |------|:-------------:|:-----------------:|:----------:|:----------:|----------|
-| `full` | Yes | ~10min | Baseline | **136x RTFx** | Short files only, max throughput |
-| `local` | Yes | ~1h | Slight increase | **124x RTFx** (-9%) | Long-file-only workloads |
-| `auto` | No | ~1h | Per-request | ~124x when local | Mixed audio lengths (recommended) |
+| `full` | Yes | ~10min | Baseline | **178x RTFx** | Short files only, max throughput |
+| `local` | Yes | ~1h | Slight increase | **162x RTFx** (-9%) | Long-file-only workloads |
+| `auto` | No | ~1h | Per-request | ~162x when local | Mixed audio lengths (recommended) |
 
 **`full`** — Default O(T²) attention. Best throughput for short files. OOMs above ~10min on L4.
 
@@ -710,8 +722,8 @@ This server addresses six issues in NeMo's inference path that cause crashes or 
 
 | Metric | Value |
 |--------|-------|
-| Peak RPS | **15.0** (c=256) |
-| RTFx | **136x** |
+| Peak RPS | **19.5** (c=256) |
+| RTFx | **178x** |
 | Max tested concurrency | c=512 (0 failures) |
 
 **Streaming results** (L4 GPU, Nemotron 3.5 ASR Streaming 0.6B):
