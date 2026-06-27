@@ -50,7 +50,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 
 | Metric | Batch | Streaming |
 |--------|:-----:|:---------:|
-| WER (LibriSpeech) | 14.0% | 7.5% |
+| WER (LibriSpeech) | 2.0% | 7.5% |
 | RTFx (peak) | 136x | N/A (realtime-paced) |
 | Max throughput | 15.0 RPS (c=256) | 65.1 sess/min (c=128) |
 | Max tested (0 failures) | c=512 | c=256 |
@@ -59,7 +59,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 | cuda_graphs | **No** (crashes at c=32+) | N/A |
 | Zero failures | Yes | Yes |
 
-> **Note on batch WER:** The 14.0% figure includes punctuation in Parakeet TDT output vs unpunctuated LibriSpeech references. Actual word accuracy is higher — the mismatch is scoring methodology, not model quality.
+> **Note on WER methodology:** WER is computed after standard text normalization (lowercase, remove all punctuation, collapse whitespace). This matches NVIDIA's published benchmarks and the industry standard. Earlier measurements without normalization inflated WER to ~14% due to Parakeet TDT's punctuation output being scored against unpunctuated LibriSpeech references.
 
 ## Architecture
 

@@ -189,15 +189,20 @@ def prepare_quality_audio() -> list[dict]:
     return samples
 
 
-def _strip_punct(text: str) -> str:
-    """Strip trailing punctuation from each word for fair WER comparison."""
-    return " ".join(w.strip(".,!?;:\"'") for w in text.split())
+def _normalize_text(text: str) -> str:
+    """Normalize text for WER: lowercase, remove all punctuation, collapse whitespace."""
+    import re
+
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def compute_wer(reference: str, hypothesis: str) -> float:
     """Word Error Rate between reference and hypothesis."""
-    ref_words = _strip_punct(reference.lower()).split()
-    hyp_words = _strip_punct(hypothesis.lower()).split()
+    ref_words = _normalize_text(reference).split()
+    hyp_words = _normalize_text(hypothesis).split()
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
 
