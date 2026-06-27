@@ -675,8 +675,14 @@ class GPUWorker:
             import torchaudio
             info = torchaudio.info(path)
             return info.num_frames / info.sample_rate
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            try:
+                import wave
+                with wave.open(path) as wf:
+                    return wf.getnframes() / wf.getframerate()
+            except Exception:
+                log.warning(f"Cannot determine audio duration for {path}: {exc}")
+                return 0.0
 
     def _switch_attention(self, to_local: bool) -> None:
         if to_local == self._attn_is_local:
