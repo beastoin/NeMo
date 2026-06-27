@@ -14,7 +14,7 @@ batch_model:
 
   # Attention mode: "full" (default), "local", or "auto"
   #   full  — O(T²) VRAM, max ~10min on L4. Best short-file throughput.
-  #   local — O(T×W) VRAM, max ~1h on L4. +0.7% WER, -9% throughput.
+  #   local — O(T×W) VRAM, max ~1h on L4. Slight WER increase, ~9% less throughput.
   #   auto  — switches per-request based on audio duration (disables torch.compile).
   attention_mode: "auto"
   auto_local_attn_threshold_sec: 600

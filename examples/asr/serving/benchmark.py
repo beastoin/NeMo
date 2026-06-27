@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Industrial ASR batch performance benchmark.
+Industrial ASR batch performance benchmark (throughput and latency only, no WER).
 
 Runs a systematic sweep across concurrency levels and audio durations,
 then produces a structured report suitable for capacity planning.
+For WER evaluation, use stress_test.py --mode quality.
 
 Usage:
     python3 benchmark.py --server http://localhost:8000

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Level 2 Industrial Benchmark — Chaos & Bottleneck Analysis.
+Level 2 Industrial Benchmark — Chaos & Bottleneck Analysis (performance only, no WER).
 
 Systematically isolates the throughput bottleneck by testing:
 1. Serial baseline (pure GPU compute time)

@@ -164,74 +164,40 @@ def prepare_quality_audio() -> list[dict]:
             else:
                 log.warning(f"TTS unavailable, skipping sentence {sent_idx}")
                 continue
-        samples.append({
-            "path": path,
-            "ref": sentence.lower().rstrip(".!?,"),
-            "name": f"tts-{sent_idx}",
-            "mode": "tts",
-        })
+        samples.append(
+            {
+                "path": path,
+                "ref": sentence,
+                "name": f"tts-{sent_idx}",
+                "mode": "tts",
+            }
+        )
 
     for sample in QUALITY_SAMPLES:
         ext = Path(sample["url"]).suffix
         cache_key = hashlib.md5(sample["url"].encode()).hexdigest()[:12]
         path = os.path.join(_CACHE_DIR, f"{cache_key}{ext}")
         if _download_file(sample["url"], path):
-            samples.append({
-                "path": path,
-                "name": sample["name"],
-                "mode": "download",
-                "expected_words": sample.get("expected_words", []),
-                "min_words": sample.get("min_words", 3),
-            })
+            samples.append(
+                {
+                    "path": path,
+                    "name": sample["name"],
+                    "mode": "download",
+                    "expected_words": sample.get("expected_words", []),
+                    "min_words": sample.get("min_words", 3),
+                }
+            )
         else:
             log.warning(f"Skipping {sample['name']} (download failed)")
 
     return samples
 
 
-def _normalize_text(text: str) -> str:
-    """Normalize text for WER using Whisper's EnglishTextNormalizer (industry standard).
-
-    Handles: lowercase, punctuation removal, British→American spelling,
-    contraction expansion (it's→it is), abbreviations (Mr.→mister), and more.
-    Falls back to simple regex normalization if whisper-normalizer is not installed.
-    """
-    try:
-        from whisper_normalizer.english import EnglishTextNormalizer
-
-        _normalizer = getattr(_normalize_text, "_inst", None)
-        if _normalizer is None:
-            _normalizer = EnglishTextNormalizer()
-            _normalize_text._inst = _normalizer
-        return _normalizer(text)
-    except ImportError:
-        import re
-
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-
-
 def compute_wer(reference: str, hypothesis: str) -> float:
-    """Word Error Rate between reference and hypothesis."""
-    ref_words = _normalize_text(reference).split()
-    hyp_words = _normalize_text(hypothesis).split()
-    if not ref_words:
-        return 0.0 if not hyp_words else 1.0
+    """Single-pair WER using jiwer + EnglishTextNormalizer (industry standard)."""
+    from wer_utils import pair_wer
 
-    d = [[0] * (len(hyp_words) + 1) for _ in range(len(ref_words) + 1)]
-    for i in range(len(ref_words) + 1):
-        d[i][0] = i
-    for j in range(len(hyp_words) + 1):
-        d[0][j] = j
-    for i in range(1, len(ref_words) + 1):
-        for j in range(1, len(hyp_words) + 1):
-            if ref_words[i - 1] == hyp_words[j - 1]:
-                d[i][j] = d[i - 1][j - 1]
-            else:
-                d[i][j] = 1 + min(d[i - 1][j], d[i][j - 1], d[i - 1][j - 1])
-    return d[len(ref_words)][len(hyp_words)] / len(ref_words)
+    return pair_wer(reference, hypothesis)
 
 
 class StressTestResult:
@@ -403,16 +369,18 @@ async def quality_test(server: str) -> dict:
                     latency = time.monotonic() - t0
                     if resp.status != 200:
                         text = await resp.text()
-                        results.append({
-                            "name": sample["name"],
-                            "status": "error",
-                            "http_status": resp.status,
-                            "detail": text[:200],
-                        })
+                        results.append(
+                            {
+                                "name": sample["name"],
+                                "status": "error",
+                                "http_status": resp.status,
+                                "detail": text[:200],
+                            }
+                        )
                         continue
 
                     data = await resp.json()
-                    hypothesis = data.get("text", "").lower().strip()
+                    hypothesis = data.get("text", "").strip()
 
                     entry = {
                         "name": sample["name"],
@@ -449,15 +417,22 @@ async def quality_test(server: str) -> dict:
 
     ok_results = [r for r in results if r.get("status") == "ok"]
     tts_results = [r for r in ok_results if "wer" in r]
-    avg_wer = sum(r["wer"] for r in tts_results) / len(tts_results) if tts_results else None
     avg_latency = sum(r["latency_ms"] for r in ok_results) / len(ok_results) if ok_results else None
+
+    corpus_wer_val = None
+    if tts_results:
+        from wer_utils import corpus_wer
+
+        tts_refs = [r["reference"] for r in tts_results]
+        tts_hyps = [r["hypothesis"] for r in tts_results]
+        corpus_wer_val = round(corpus_wer(tts_refs, tts_hyps), 4)
 
     return {
         "test": "quality",
         "total_samples": len(samples),
         "successful": len(ok_results),
         "failed": len(results) - len(ok_results),
-        "average_wer_tts": round(avg_wer, 4) if avg_wer is not None else None,
+        "corpus_wer_tts": corpus_wer_val,
         "average_latency_ms": round(avg_latency, 1) if avg_latency is not None else None,
         "samples": results,
     }
@@ -497,9 +472,7 @@ async def main():
         print(json.dumps(result.summary(), indent=2))
 
     elif args.mode == "mixed":
-        results = await mixed_stress_test(
-            args.server, args.concurrency, args.requests, args.streams, args.chunks
-        )
+        results = await mixed_stress_test(args.server, args.concurrency, args.requests, args.streams, args.chunks)
         for r in results:
             print(json.dumps(r.summary(), indent=2))
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Chaos Parameter Sweep — find optimal server config on current hardware.
+Chaos Parameter Sweep — find optimal server config on current hardware (performance only, no WER).
 
 Tests every combination of tunable parameters via the /admin/config API,
 measures throughput and latency for each, and reports the optimal config
-with minimum resource footprint.
+with minimum resource footprint. For WER evaluation, use stress_test.py --mode quality.
 
 Usage:
     python3 chaos_sweep.py --server http://localhost:8000

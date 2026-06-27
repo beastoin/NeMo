@@ -11,7 +11,7 @@ Deploy either mode independently or both together. Production-tested with [Omi](
 
 ### Batch Mode (Parakeet TDT 0.6B)
 
-All benchmarks use real LibriSpeech test-clean speech audio, not silence or TTS.
+Throughput measured with real speech audio (espeak-ng TTS); WER measured on LibriSpeech test-clean.
 
 | GPU | Peak RPS | RTFx | torch.compile | cuda_graphs | Failures |
 |-----|:--------:|:----:|:-------------:|:-----------:|:--------:|
@@ -475,7 +475,7 @@ Three attention modes are available:
 | Mode | torch.compile | Max Duration (L4) | WER Impact | Throughput | Use Case |
 |------|:-------------:|:-----------------:|:----------:|:----------:|----------|
 | `full` | Yes | ~10min | Baseline | **136x RTFx** | Short files only, max throughput |
-| `local` | Yes | ~1h | +0.7% | **124x RTFx** (-9%) | Long-file-only workloads |
+| `local` | Yes | ~1h | Slight increase | **124x RTFx** (-9%) | Long-file-only workloads |
 | `auto` | No | ~1h | Per-request | ~124x when local | Mixed audio lengths (recommended) |
 
 **`full`** — Default O(T²) attention. Best throughput for short files. OOMs above ~10min on L4.
@@ -652,9 +652,10 @@ examples/asr/serving/
   gpu_worker.py            # Dedicated GPU inference thread — batch + streaming dispatch, attention mode switching
   batch_engine.py          # Dynamic batching engine for offline transcription
   stream_engine.py         # Streaming session manager — lifecycle + chunk routing
-  stress_test.py           # Batch/stream/mixed/quality test client
-  stream_benchmark.py      # Streaming-specific benchmark (concurrency sweep, sustained load)
-  benchmark.py             # Industrial batch benchmark (sweep, duration, cost analysis)
+  wer_utils.py             # Industry-standard WER evaluation (jiwer + EnglishTextNormalizer)
+  stress_test.py           # Batch/stream/mixed/quality test client (WER via wer_utils)
+  stream_benchmark.py      # Streaming benchmark with WER quality check
+  benchmark.py             # Industrial batch benchmark — throughput/latency only
   benchmark-report.html    # L4/T4 batch benchmark report
   requirements-serving.txt # Python dependencies (NeMo assumed pre-installed)
 

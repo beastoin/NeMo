@@ -45,13 +45,19 @@ def _tts_to_pcm16(text, sample_rate=16000):
     try:
         subprocess.run(
             ["espeak-ng", "-w", tmp_path, "--stdin", "-s", "150", "-a", "100"],
-            input=text, text=True, capture_output=True, check=True, timeout=30,
+            input=text,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=30,
         )
         import soundfile as sf
+
         data, sr = sf.read(tmp_path, dtype='int16')
         if sr != sample_rate:
             data_f = data.astype(np.float32) / 32768.0
             import librosa
+
             data_f = librosa.resample(data_f, orig_sr=sr, target_sr=sample_rate)
             data = (data_f * 32768.0).clip(-32768, 32767).astype(np.int16)
         return data.tobytes()
@@ -94,12 +100,14 @@ def prepare_audio_samples(sample_rate=16000):
         for dur in [3.0, 5.0, 8.0]:
             t = np.linspace(0, dur, int(dur * sample_rate), dtype=np.float32)
             tone = (np.sin(2 * np.pi * 440 * t) * 16000).astype(np.int16)
-            samples.append({
-                "pcm16": tone.tobytes(),
-                "text": "(synthetic tone)",
-                "duration_s": dur,
-                "name": f"tone-{dur}s",
-            })
+            samples.append(
+                {
+                    "pcm16": tone.tobytes(),
+                    "text": "(synthetic tone)",
+                    "duration_s": dur,
+                    "name": f"tone-{dur}s",
+                }
+            )
 
     return samples
 
@@ -110,15 +118,15 @@ def chunk_audio(pcm16_bytes, chunk_duration_ms=160, sample_rate=16000):
     chunk_bytes = chunk_samples * 2
     chunks = []
     for i in range(0, len(pcm16_bytes), chunk_bytes):
-        chunk = pcm16_bytes[i:i + chunk_bytes]
+        chunk = pcm16_bytes[i : i + chunk_bytes]
         if len(chunk) > 0:
             chunks.append(chunk)
     return chunks
 
 
-async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
-                             sample_rate=16000, realtime_pace=True,
-                             ws_timeout=30):
+async def stream_one_session(
+    ws_url, pcm16_bytes, chunk_duration_ms=160, sample_rate=16000, realtime_pace=True, ws_timeout=30
+):
     """Run one streaming session and collect per-chunk latencies."""
     import websockets
 
@@ -176,8 +184,9 @@ async def stream_one_session(ws_url, pcm16_bytes, chunk_duration_ms=160,
     return result
 
 
-async def concurrency_sweep(ws_url, audio_samples, levels, chunk_duration_ms=160,
-                            sample_rate=16000, realtime_pace=True):
+async def concurrency_sweep(
+    ws_url, audio_samples, levels, chunk_duration_ms=160, sample_rate=16000, realtime_pace=True
+):
     """Run concurrent streaming sessions at various levels."""
     results = []
     for conc in levels:
@@ -188,8 +197,11 @@ async def concurrency_sweep(ws_url, audio_samples, levels, chunk_duration_ms=160
             async with semaphore:
                 sample = audio_samples[idx % len(audio_samples)]
                 return await stream_one_session(
-                    ws_url, sample["pcm16"], chunk_duration_ms,
-                    sample_rate, realtime_pace,
+                    ws_url,
+                    sample["pcm16"],
+                    chunk_duration_ms,
+                    sample_rate,
+                    realtime_pace,
                 )
 
         t_wall_start = time.monotonic()
@@ -239,8 +251,9 @@ async def concurrency_sweep(ws_url, audio_samples, levels, chunk_duration_ms=160
     return results
 
 
-async def sustained_streaming(ws_url, audio_samples, concurrency, duration_minutes,
-                              chunk_duration_ms=160, sample_rate=16000):
+async def sustained_streaming(
+    ws_url, audio_samples, concurrency, duration_minutes, chunk_duration_ms=160, sample_rate=16000
+):
     """Run sustained concurrent streams for a duration, cycling sessions."""
     log.info(f"  Sustained streaming: concurrency={concurrency}, duration={duration_minutes}min")
     deadline = time.monotonic() + duration_minutes * 60
@@ -251,8 +264,11 @@ async def sustained_streaming(ws_url, audio_samples, concurrency, duration_minut
     async def run_session(session_idx):
         sample = audio_samples[session_idx % len(audio_samples)]
         return await stream_one_session(
-            ws_url, sample["pcm16"], chunk_duration_ms,
-            sample_rate, realtime_pace=True,
+            ws_url,
+            sample["pcm16"],
+            chunk_duration_ms,
+            sample_rate,
+            realtime_pace=True,
         )
 
     while time.monotonic() < deadline or active:
@@ -343,17 +359,31 @@ async def latency_mode_comparison(ws_url, audio_samples, modes=None):
 
 
 async def quality_check(ws_url, audio_samples, chunk_duration_ms=160, sample_rate=16000):
-    """Run a single stream per sample and check transcription quality."""
+    """Run a single stream per sample, compute per-sample and corpus-level WER.
+
+    Note: TTS samples (espeak-ng) have inherently high WER due to robotic prosody.
+    For authoritative WER, use LibriSpeech test-clean samples.
+    """
+    from wer_utils import corpus_wer, pair_wer
+
     log.info("  Quality check: single stream per sample")
     results = []
+    refs = []
+    hyps = []
     for sample in audio_samples:
         r = await stream_one_session(
-            ws_url, sample["pcm16"], chunk_duration_ms, sample_rate, realtime_pace=False,
+            ws_url,
+            sample["pcm16"],
+            chunk_duration_ms,
+            sample_rate,
+            realtime_pace=False,
         )
+        hypothesis = r.get("final_text", "")
+        reference = sample["text"]
         entry = {
             "name": sample["name"],
-            "reference": sample["text"],
-            "hypothesis": r.get("final_text", ""),
+            "reference": reference,
+            "hypothesis": hypothesis,
             "ok": r["ok"],
             "audio_duration_s": round(sample["duration_s"], 2),
             "wall_clock_s": round(r["wall_clock_s"], 3),
@@ -363,26 +393,36 @@ async def quality_check(ws_url, audio_samples, chunk_duration_ms=160, sample_rat
             lats = sorted(r["chunk_latencies_ms"])
             entry["chunk_latency_p50_ms"] = round(lats[len(lats) // 2], 1)
 
-        results.append(entry)
-        status = "ok" if r["ok"] else "FAIL"
-        log.info(f"    [{status}] {sample['name']}: \"{r.get('final_text', '')[:60]}\"")
+        if r["ok"] and reference and not reference.startswith("("):
+            wer_val = pair_wer(reference, hypothesis)
+            entry["wer"] = round(wer_val, 4)
+            refs.append(reference)
+            hyps.append(hypothesis)
+            log.info(f"    [ok] {sample['name']}: WER={wer_val:.1%} \"{hypothesis[:60]}\"")
+        else:
+            status = "ok" if r["ok"] else "FAIL"
+            log.info(f"    [{status}] {sample['name']}: \"{hypothesis[:60]}\"")
 
-    return results
+        results.append(entry)
+
+    summary = {"samples": results}
+    if refs:
+        summary["corpus_wer"] = round(corpus_wer(refs, hyps), 4)
+        log.info(f"  Corpus-level WER: {summary['corpus_wer']:.2%}")
+
+    return summary
 
 
 async def main():
     parser = argparse.ArgumentParser(description="Streaming ASR benchmark")
-    parser.add_argument("--server", default="ws://localhost:8000",
-                        help="WebSocket server URL (ws:// or wss://)")
+    parser.add_argument("--server", default="ws://localhost:8000", help="WebSocket server URL (ws:// or wss://)")
     parser.add_argument("--sustained-minutes", type=int, default=3)
-    parser.add_argument("--concurrency", type=str, default="1,2,4,8,16,32",
-                        help="Comma-separated concurrency levels")
-    parser.add_argument("--chunk-ms", type=int, default=160,
-                        help="Chunk duration in ms (must match server config)")
-    parser.add_argument("--no-realtime-pace", action="store_true",
-                        help="Send chunks as fast as possible (stress test)")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Save JSON report to file")
+    parser.add_argument("--concurrency", type=str, default="1,2,4,8,16,32", help="Comma-separated concurrency levels")
+    parser.add_argument("--chunk-ms", type=int, default=160, help="Chunk duration in ms (must match server config)")
+    parser.add_argument(
+        "--no-realtime-pace", action="store_true", help="Send chunks as fast as possible (stress test)"
+    )
+    parser.add_argument("--output", type=str, default=None, help="Save JSON report to file")
     args = parser.parse_args()
 
     ws_url = args.server
@@ -396,6 +436,7 @@ async def main():
 
     # Health check via HTTP
     import aiohttp
+
     http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://")
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{http_url}/health") as resp:
@@ -404,8 +445,9 @@ async def main():
 
     log.info("Preparing audio samples...")
     audio_samples = prepare_audio_samples()
-    log.info(f"Loaded {len(audio_samples)} samples "
-             f"(total {sum(s['duration_s'] for s in audio_samples):.1f}s audio)")
+    log.info(
+        f"Loaded {len(audio_samples)} samples " f"(total {sum(s['duration_s'] for s in audio_samples):.1f}s audio)"
+    )
 
     report = {
         "benchmark": "NeMo ASR Streaming — Performance Report",
@@ -431,14 +473,19 @@ async def main():
     # Phase 3: Concurrency sweep
     log.info("Phase 3: Concurrency sweep")
     report["concurrency_sweep"] = await concurrency_sweep(
-        ws_url, audio_samples, conc_levels, args.chunk_ms,
+        ws_url,
+        audio_samples,
+        conc_levels,
+        args.chunk_ms,
         realtime_pace=realtime_pace,
     )
 
     # Phase 4: Sustained load
     log.info(f"Phase 4: Sustained load ({args.sustained_minutes} min)")
     report["sustained_load"] = await sustained_streaming(
-        ws_url, audio_samples, concurrency=max(4, min(conc_levels)),
+        ws_url,
+        audio_samples,
+        concurrency=max(4, min(conc_levels)),
         duration_minutes=args.sustained_minutes,
         chunk_duration_ms=args.chunk_ms,
     )
