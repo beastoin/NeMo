@@ -190,13 +190,27 @@ def prepare_quality_audio() -> list[dict]:
 
 
 def _normalize_text(text: str) -> str:
-    """Normalize text for WER: lowercase, remove all punctuation, collapse whitespace."""
-    import re
+    """Normalize text for WER using Whisper's EnglishTextNormalizer (industry standard).
 
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    Handles: lowercase, punctuation removal, British→American spelling,
+    contraction expansion (it's→it is), abbreviations (Mr.→mister), and more.
+    Falls back to simple regex normalization if whisper-normalizer is not installed.
+    """
+    try:
+        from whisper_normalizer.english import EnglishTextNormalizer
+
+        _normalizer = getattr(_normalize_text, "_inst", None)
+        if _normalizer is None:
+            _normalizer = EnglishTextNormalizer()
+            _normalize_text._inst = _normalizer
+        return _normalizer(text)
+    except ImportError:
+        import re
+
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
 
 def compute_wer(reference: str, hypothesis: str) -> float:

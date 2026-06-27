@@ -59,7 +59,7 @@ All benchmarks: real speech audio, L4 GPU, NGC 26.02 container (PyTorch 2.6 + CU
 | cuda_graphs | **No** (crashes at c=32+) | N/A |
 | Zero failures | Yes | Yes |
 
-> **Note on WER methodology:** WER is computed after standard text normalization (lowercase, remove all punctuation, collapse whitespace). This matches NVIDIA's published benchmarks and the industry standard. Earlier measurements without normalization inflated WER to ~14% due to Parakeet TDT's punctuation output being scored against unpunctuated LibriSpeech references.
+> **WER methodology:** Computed using [Whisper's EnglishTextNormalizer](https://github.com/jianfch/whisper-normalizer) — the industry standard for English ASR evaluation, also used by NVIDIA's NeMo speechlm2 metrics. Normalizes casing, punctuation, British/American spelling (honour→honor), contractions (it's→it is), and abbreviations (Mr.→mister) before comparison.
 
 ## Architecture
 
