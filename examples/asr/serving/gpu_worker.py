@@ -85,10 +85,23 @@ class GPUWorker:
         self._attn_is_local = False
         self._max_file_duration_sec = 0
         self._raw_batch_model = None
+        self._batch_model_compiled = None
+        self._batch_model_local = None
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set() and self._load_error is None
+
+    @property
+    def attention_info(self) -> dict:
+        info = {
+            "attention_mode": self._attn_mode,
+            "auto_threshold_sec": self._attn_auto_threshold_sec,
+        }
+        if self._attn_mode == "dual":
+            info["compiled_model"] = self._batch_model_compiled is not None
+            info["local_model"] = self._batch_model_local is not None
+        return info
 
     def start(self, batch_cfg: dict, stream_cfg: dict) -> None:
         self._batch_cfg = batch_cfg
@@ -221,6 +234,9 @@ class GPUWorker:
                     item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
                 except Exception as exc:
                     item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                    if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
+                        log.warning("OOM detected — releasing CUDA cache to prevent cascade")
+                        torch.cuda.empty_cache()
                 finally:
                     self._maybe_gc()
 
@@ -408,6 +424,9 @@ class GPUWorker:
                 item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
+                    log.warning(f"OOM in pool worker {idx} — releasing CUDA cache")
+                    torch.cuda.empty_cache()
             finally:
                 self._maybe_gc()
         log.info(f"Pool worker {idx} stopped")
@@ -436,6 +455,9 @@ class GPUWorker:
                 item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
+                    log.warning("OOM detected in prefetch mode — releasing CUDA cache")
+                    torch.cuda.empty_cache()
             finally:
                 self._maybe_gc()
 
@@ -507,8 +529,10 @@ class GPUWorker:
             return self._stream_close(item.payload)
         raise ValueError(f"Unknown work type: {item.work_type}")
 
-    def _load_one_model(self, nemo_asr, device, idx=0):
+    def _load_one_model(self, nemo_asr, device, idx=0, role=None):
         tag = f" (pool #{idx})" if self._pool_size > 1 else ""
+        if role:
+            tag = f" ({role})"
         log.info(f"Loading batch model{tag}: {self._batch_cfg['name']}")
         model = nemo_asr.models.ASRModel.from_pretrained(self._batch_cfg["name"], map_location=device)
         model.eval()
@@ -518,7 +542,16 @@ class GPUWorker:
         self._attn_auto_threshold_sec = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
         self._max_file_duration_sec = self._batch_cfg.get("max_file_duration_sec", 0)
 
-        if self._attn_mode == "local":
+        if role == "local":
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            model.change_subsampling_conv_chunking_factor(1)
+            log.info(
+                f"Attention mode: local{tag} (context={self._attn_local_context}) — "
+                f"linear VRAM scaling, no torch.compile"
+            )
+        elif role == "compiled":
+            log.info(f"Attention mode: full{tag} — quadratic VRAM, torch.compile eligible")
+        elif self._attn_mode == "local":
             model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
             model.change_subsampling_conv_chunking_factor(1)
             self._attn_is_local = True
@@ -539,14 +572,84 @@ class GPUWorker:
             if hasattr(model, 'decoding') and hasattr(model.decoding, 'decoding'):
                 disabled = model.decoding.decoding.disable_cuda_graphs()
                 log.info(f"CUDA graph decoding disabled{tag} (was active: {disabled})")
-        if self._batch_cfg.get("compile", False) and self._attn_mode != "auto":
+
+        should_compile = self._batch_cfg.get("compile", False)
+        if role == "compiled" and should_compile:
             log.info(f"Compiling batch model{tag} with torch.compile")
             model = torch.compile(model)
-        elif self._attn_mode == "auto" and self._batch_cfg.get("compile", False):
+        elif role == "compiled" and not should_compile:
+            log.info(f"Skipping torch.compile{tag} — compile=false in config")
+        elif role == "local":
+            pass
+        elif should_compile and self._attn_mode not in ("auto", "dual"):
+            log.info(f"Compiling batch model{tag} with torch.compile")
+            model = torch.compile(model)
+        elif self._attn_mode == "auto" and should_compile:
             log.info(f"Skipping torch.compile{tag} — incompatible with auto attention switching")
         return model
 
+    def _load_dual_models(self, nemo_asr, device) -> None:
+        log.info("Loading dual-model architecture: compiled (full) + uncompiled (local)")
+        threshold = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
+
+        self._batch_model_compiled = self._load_one_model(nemo_asr, device, role="compiled")
+        torch.cuda.empty_cache()
+        self._log_vram("after compiled model load")
+
+        self._batch_model_local = self._load_one_model(nemo_asr, device, role="local")
+        torch.cuda.empty_cache()
+        self._log_vram("after local model load")
+
+        self._batch_model = self._batch_model_compiled
+
+        self._warmup_model(self._batch_model_compiled, "compiled")
+        self._log_vram("after compiled model warmup")
+        self._warmup_model(self._batch_model_local, "local")
+        self._log_vram("after local model warmup")
+
+        log.info(
+            f"Dual-model ready: compiled (full attn) for <{threshold}s, "
+            f"local attn for >={threshold}s or unknown duration"
+        )
+
+    def _warmup_model(self, model, label: str) -> None:
+        import numpy as np
+        import soundfile as sf
+        import tempfile
+
+        log.info(f"Warming up {label} model...")
+        sr = 16000
+        audio = np.random.randn(sr * 2).astype(np.float32) * 0.01
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            sf.write(f.name, audio, sr)
+            warmup_path = f.name
+        try:
+            model.transcribe([warmup_path], batch_size=1, verbose=False)
+        except Exception as exc:
+            log.warning(f"Warmup failed for {label} model: {exc}")
+        finally:
+            try:
+                os.unlink(warmup_path)
+            except OSError:
+                pass
+        log.info(f"Warmup complete for {label} model")
+
+    @staticmethod
+    def _log_vram(stage: str) -> None:
+        free, total = torch.cuda.mem_get_info(0)
+        used = (total - free) / 1024**2
+        log.info(f"VRAM {stage}: {used:.0f}MiB / {total / 1024**2:.0f}MiB")
+
     def _load_models(self) -> None:
+        if self._batch_cfg.get("name"):
+            attn_mode = self._batch_cfg.get("attention_mode", "full")
+            pool_size = self._batch_cfg.get("model_pool_size", 1)
+            if attn_mode == "dual" and pool_size > 1:
+                raise RuntimeError(
+                    "attention_mode='dual' is incompatible with model_pool_size > 1. "
+                    "Dual mode loads two models (compiled + local) on a single GPU thread."
+                )
+
         import nemo.collections.asr as nemo_asr
 
         torch.backends.cudnn.benchmark = True
@@ -557,8 +660,11 @@ class GPUWorker:
         if self._batch_cfg.get("name"):
             device = self._batch_cfg.get("device", "cuda:0")
             self._pool_size = self._batch_cfg.get("model_pool_size", 1)
+            attn_mode = self._batch_cfg.get("attention_mode", "full")
 
-            if self._pool_size > 1:
+            if attn_mode == "dual":
+                self._load_dual_models(nemo_asr, device)
+            elif self._pool_size > 1:
                 log.info(f"Loading model pool: {self._pool_size} instances")
                 for i in range(self._pool_size):
                     model = self._load_one_model(nemo_asr, device, i)
@@ -668,7 +774,64 @@ class GPUWorker:
     def _batch_transcribe(self, payload: dict) -> list:
         if self._batch_model is None:
             raise RuntimeError("Batch model not loaded — server started in streaming-only mode")
+        if self._attn_mode == "dual":
+            return self._batch_transcribe_dual(payload)
         return self._batch_transcribe_with_model(self._batch_model, payload)
+
+    def _batch_transcribe_dual(self, payload: dict) -> list:
+        audio_paths = payload["audio_paths"]
+        timestamps = payload.get("timestamps", False)
+        batch_size = payload.get("batch_size", len(audio_paths))
+
+        if self._max_file_duration_sec > 0:
+            for path in audio_paths:
+                dur = self._get_audio_duration_sec(path)
+                if dur > self._max_file_duration_sec:
+                    raise RuntimeError(
+                        f"Audio file {dur:.0f}s exceeds max_file_duration_sec "
+                        f"({self._max_file_duration_sec}s). Use shorter files."
+                    )
+
+        compiled_indices = []
+        local_indices = []
+        for i, path in enumerate(audio_paths):
+            dur = self._get_audio_duration_sec(path)
+            if dur <= 0.0 or dur >= self._attn_auto_threshold_sec:
+                local_indices.append(i)
+            else:
+                compiled_indices.append(i)
+
+        results = [None] * len(audio_paths)
+
+        if compiled_indices:
+            sub_paths = [audio_paths[i] for i in compiled_indices]
+            sub_payload = {
+                "audio_paths": sub_paths,
+                "timestamps": timestamps,
+                "batch_size": len(sub_paths),
+            }
+            sub_results = self._batch_transcribe_with_model(self._batch_model_compiled, sub_payload)
+            for j, idx in enumerate(compiled_indices):
+                results[idx] = sub_results[j]
+            log.info(f"Dual-route: {len(compiled_indices)} files → compiled model")
+
+        if local_indices:
+            sub_paths = [audio_paths[i] for i in local_indices]
+            sub_payload = {
+                "audio_paths": sub_paths,
+                "timestamps": timestamps,
+                "batch_size": len(sub_paths),
+            }
+            sub_results = self._batch_transcribe_with_model(self._batch_model_local, sub_payload)
+            for j, idx in enumerate(local_indices):
+                results[idx] = sub_results[j]
+            unknown_count = sum(1 for i in local_indices if self._get_audio_duration_sec(audio_paths[i]) <= 0.0)
+            log.info(
+                f"Dual-route: {len(local_indices)} files → local model"
+                f"{f' ({unknown_count} unknown duration)' if unknown_count else ''}"
+            )
+
+        return results
 
     def _get_audio_duration_sec(self, path: str) -> float:
         try:

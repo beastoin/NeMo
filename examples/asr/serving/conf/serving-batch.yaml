@@ -12,11 +12,14 @@ batch_model:
   amp: true
   cuda_graphs: false
 
-  # Attention mode: "full" (default), "local", or "auto"
+  # Attention mode: "full" (default), "local", "auto", or "dual"
   #   full  — O(T²) VRAM, max ~10min on L4. Best short-file throughput.
   #   local — O(T×W) VRAM, max ~1h on L4. Slight WER increase, ~9% less throughput.
   #   auto  — switches per-request based on audio duration (disables torch.compile).
-  attention_mode: "auto"
+  #   dual  — two models: compiled (full attn) for short files + uncompiled (local attn)
+  #           for long files. Best of both: compiled throughput for p95 traffic, local
+  #           attention for rare long files. ~2.4 GB additional VRAM for second model.
+  attention_mode: "dual"
   auto_local_attn_threshold_sec: 600
   local_attn_context: [128, 128]
 
