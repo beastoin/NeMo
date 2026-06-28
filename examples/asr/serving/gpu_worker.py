@@ -87,6 +87,7 @@ class GPUWorker:
         self._raw_batch_model = None
         self._batch_model_compiled = None
         self._batch_model_local = None
+        self._oom_recovered_count = 0
 
     @property
     def is_ready(self) -> bool:
@@ -235,7 +236,8 @@ class GPUWorker:
                 except Exception as exc:
                     item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
                     if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
-                        log.warning("OOM detected — releasing CUDA cache to prevent cascade")
+                        self._oom_recovered_count += 1
+                        log.warning(f"OOM #{self._oom_recovered_count} — releasing CUDA cache to prevent cascade")
                         torch.cuda.empty_cache()
                 finally:
                     self._maybe_gc()
@@ -425,7 +427,8 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
                 if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
-                    log.warning(f"OOM in pool worker {idx} — releasing CUDA cache")
+                    self._oom_recovered_count += 1
+                    log.warning(f"OOM #{self._oom_recovered_count} in pool worker {idx} — releasing CUDA cache")
                     torch.cuda.empty_cache()
             finally:
                 self._maybe_gc()
@@ -456,7 +459,8 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
                 if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
-                    log.warning("OOM detected in prefetch mode — releasing CUDA cache")
+                    self._oom_recovered_count += 1
+                    log.warning(f"OOM #{self._oom_recovered_count} in prefetch mode — releasing CUDA cache")
                     torch.cuda.empty_cache()
             finally:
                 self._maybe_gc()

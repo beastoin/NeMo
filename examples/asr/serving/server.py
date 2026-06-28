@@ -145,10 +145,15 @@ async def health():
 
 @app.get("/metrics")
 async def metrics():
+    gpu_metrics = {}
+    if gpu_worker:
+        gpu_metrics["oom_recovered"] = gpu_worker._oom_recovered_count
+        gpu_metrics["attention"] = gpu_worker.attention_info
     return {
         "uptime_seconds": round(time.monotonic() - start_time, 1),
         "batch": batch_engine.metrics if batch_engine else {},
         "stream": stream_engine.metrics if stream_engine else {},
+        "gpu": gpu_metrics,
     }
 
 
