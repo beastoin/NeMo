@@ -31,3 +31,9 @@ batcher:
   max_wait_seconds: 0.002
   max_queue_depth: 4096
   max_upload_bytes: 536870912
+
+  # VRAM-aware batch sizing: dynamically caps batch size based on audio
+  # duration to prevent OOM. Set vram_safety_factor to 0 to disable.
+  vram_safety_factor: 0.8
+  vram_bytes_per_t2: 136.6
+  starvation_timeout_sec: 5.0

@@ -47,6 +47,7 @@ class PendingRequest:
     future: asyncio.Future
     owns_file: bool = False
     submitted_at: float = field(default_factory=time.monotonic)
+    duration_sec: Optional[float] = None
 
 
 class BatchEngine:
@@ -58,11 +59,20 @@ class BatchEngine:
         max_batch_size: int = 32,
         max_wait_seconds: float = 0.1,
         max_queue_depth: int = 256,
+        vram_safety_factor: float = 0.8,
+        vram_bytes_per_t2: float = 136.6,
+        starvation_timeout_sec: float = 5.0,
     ):
         self._gpu_worker = gpu_worker
         self._max_batch_size = max_batch_size
         self._max_wait_seconds = max_wait_seconds
         self._max_queue_depth = max_queue_depth
+        self._vram_safety_factor = vram_safety_factor
+        self._vram_bytes_per_t2 = vram_bytes_per_t2
+        self._starvation_timeout = starvation_timeout_sec
+        self._vram_available_mb = 0.0
+        self._attention_mode = "full"
+        self._auto_threshold_sec = 600.0
         self._pending: list[PendingRequest] = []
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
@@ -73,10 +83,23 @@ class BatchEngine:
             "total_batches": 0,
             "total_files": 0,
             "rejected_requests": 0,
+            "vram_limited_batches": 0,
         }
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        vram = self._gpu_worker.vram_info
+        self._attention_mode = vram.get("attention_mode", "full")
+        self._auto_threshold_sec = vram.get("auto_threshold_sec", 600.0)
+        if self._vram_safety_factor > 0 and vram["total_mb"] > 0:
+            self._vram_available_mb = vram["total_mb"] * self._vram_safety_factor - vram["baseline_mb"]
+            log.info(
+                f"VRAM-aware batching enabled: {self._vram_available_mb:.0f} MB budget "
+                f"(total={vram['total_mb']:.0f}, baseline={vram['baseline_mb']:.0f}, "
+                f"safety={self._vram_safety_factor}, coeff={self._vram_bytes_per_t2})"
+            )
+        else:
+            log.info("VRAM-aware batching disabled (safety_factor=0 or no VRAM info)")
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:
@@ -89,6 +112,42 @@ class BatchEngine:
         while self._pending:
             await self._flush_batch()
 
+    @staticmethod
+    def _get_audio_duration(path: str) -> Optional[float]:
+        try:
+            import wave
+
+            with wave.open(path) as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception:
+            pass
+        try:
+            import soundfile as sf
+
+            info = sf.info(path)
+            return info.duration
+        except Exception:
+            pass
+        return None
+
+    def _estimate_max_batch(self, max_duration_sec: float) -> int:
+        if self._vram_available_mb <= 0 or max_duration_sec <= 0:
+            return self._max_batch_size
+        if self._attention_mode == "local":
+            return self._max_batch_size
+        if self._attention_mode == "auto" and max_duration_sec >= self._auto_threshold_sec:
+            return self._max_batch_size
+        T = max_duration_sec / 0.08
+        per_file_mb = self._vram_bytes_per_t2 * T * T / (1024 * 1024)
+        if per_file_mb <= 0:
+            return self._max_batch_size
+        return max(1, min(self._max_batch_size, int(self._vram_available_mb / per_file_mb)))
+
+    def _effective_duration(self, req: PendingRequest) -> float:
+        if req.duration_sec is not None:
+            return req.duration_sec
+        return self._auto_threshold_sec
+
     async def submit(self, audio_path: str, timestamps: bool = False, owns_file: bool = False) -> dict:
         """Submit a file for transcription. Returns when the batch completes.
 
@@ -96,21 +155,23 @@ class BatchEngine:
         after GPU processing completes (even on error or cancellation).
         """
         enqueued = False
+        duration = self._get_audio_duration(audio_path)
         try:
             async with self._lock:
                 if len(self._pending) >= self._max_queue_depth:
                     self._metrics["rejected_requests"] += 1
-                    raise QueueFullError(
-                        f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}"
-                    )
+                    raise QueueFullError(f"Queue depth {len(self._pending)} exceeds limit {self._max_queue_depth}")
 
                 future = self._loop.create_future()
-                self._pending.append(PendingRequest(
-                    audio_path=audio_path,
-                    timestamps=timestamps,
-                    future=future,
-                    owns_file=owns_file,
-                ))
+                self._pending.append(
+                    PendingRequest(
+                        audio_path=audio_path,
+                        timestamps=timestamps,
+                        future=future,
+                        owns_file=owns_file,
+                        duration_sec=duration,
+                    )
+                )
                 enqueued = True
                 self._metrics["total_requests"] += 1
 
@@ -130,20 +191,73 @@ class BatchEngine:
             if self._pending:
                 await self._flush_batch()
 
+    def _form_vram_safe_batch(self, candidates: list[PendingRequest]) -> list[PendingRequest]:
+        if not candidates or self._vram_available_mb <= 0:
+            return candidates[: self._max_batch_size]
+
+        now = time.monotonic()
+        starved = [r for r in candidates if now - r.submitted_at > self._starvation_timeout]
+
+        if starved:
+            anchor = min(starved, key=lambda r: r.submitted_at)
+            anchor_dur = self._effective_duration(anchor)
+            limit = self._estimate_max_batch(anchor_dur)
+            others = sorted(
+                [r for r in candidates if r is not anchor],
+                key=lambda r: self._effective_duration(r),
+            )
+            batch = [anchor]
+            for req in others:
+                if len(batch) >= limit:
+                    break
+                candidate_max_dur = max(anchor_dur, self._effective_duration(req))
+                new_limit = self._estimate_max_batch(candidate_max_dur)
+                if len(batch) + 1 <= new_limit:
+                    batch.append(req)
+            return batch
+
+        sorted_candidates = sorted(candidates, key=lambda r: self._effective_duration(r))
+        n = min(self._max_batch_size, len(sorted_candidates))
+        while n > 1:
+            longest_dur = self._effective_duration(sorted_candidates[n - 1])
+            limit = self._estimate_max_batch(longest_dur)
+            if n <= limit:
+                break
+            n = max(1, limit)
+        return sorted_candidates[:n]
+
     async def _flush_batch(self) -> None:
         async with self._lock:
             if not self._pending:
                 return
-            batch = self._pending[: self._max_batch_size]
-            self._pending = self._pending[self._max_batch_size:]
 
-        # Partition by timestamps option so we don't mix decode settings
-        ts_batch = [r for r in batch if r.timestamps]
-        no_ts_batch = [r for r in batch if not r.timestamps]
+            ts_pending = [r for r in self._pending if r.timestamps]
+            no_ts_pending = [r for r in self._pending if not r.timestamps]
+
+            no_ts_batch = self._form_vram_safe_batch(no_ts_pending) if no_ts_pending else []
+            ts_batch = self._form_vram_safe_batch(ts_pending) if ts_pending else []
+
+            taken = set(id(r) for r in no_ts_batch + ts_batch)
+            self._pending = [r for r in self._pending if id(r) not in taken]
+
+        batch = no_ts_batch + ts_batch
+        if not batch:
+            return
+
+        static_limit = self._max_batch_size
+        actual = len(batch)
+        if actual < static_limit and self._vram_available_mb > 0:
+            self._metrics["vram_limited_batches"] += 1
 
         self._metrics["total_batches"] += 1
-        self._metrics["total_files"] += len(batch)
-        log.info(f"Flushing batch: {len(batch)} files (ts={len(ts_batch)}, no_ts={len(no_ts_batch)})")
+        self._metrics["total_files"] += actual
+
+        durations = [self._effective_duration(r) for r in batch]
+        max_dur = max(durations) if durations else 0
+        log.info(
+            f"Flushing batch: {actual} files (ts={len(ts_batch)}, no_ts={len(no_ts_batch)}, "
+            f"max_dur={max_dur:.1f}s, limit={self._estimate_max_batch(max_dur)})"
+        )
 
         for sub_batch, timestamps in [(no_ts_batch, False), (ts_batch, True)]:
             if not sub_batch:

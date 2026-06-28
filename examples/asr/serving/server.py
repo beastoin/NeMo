@@ -99,6 +99,9 @@ async def lifespan(app: FastAPI):
         max_batch_size=batcher_cfg.get("max_batch_size", 32),
         max_wait_seconds=batcher_cfg.get("max_wait_seconds", 0.1),
         max_queue_depth=batcher_cfg.get("max_queue_depth", 256),
+        vram_safety_factor=batcher_cfg.get("vram_safety_factor", 0.8),
+        vram_bytes_per_t2=batcher_cfg.get("vram_bytes_per_t2", 136.6),
+        starvation_timeout_sec=batcher_cfg.get("starvation_timeout_sec", 5.0),
     )
     await batch_engine.start()
 
