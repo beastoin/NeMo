@@ -57,6 +57,7 @@ class TestEstimateMaxBatch(unittest.TestCase):
         self.gpu = _make_mock_gpu_worker()
         self.engine = BatchEngine(self.gpu, max_batch_size=32)
         self.engine._vram_available_mb = 23034.0 * 0.8 - 5262.0  # ~13165 MB
+        self.engine._vram_enabled = True
         self.engine._attention_mode = "full"
         self.engine._auto_threshold_sec = 600.0
 
@@ -94,9 +95,20 @@ class TestEstimateMaxBatch(unittest.TestCase):
         self.assertEqual(limit, 32)
 
     def test_disabled_returns_max(self):
-        self.engine._vram_available_mb = 0.0
+        self.engine._vram_enabled = False
         limit = self.engine._estimate_max_batch(300.0)
         self.assertEqual(limit, 32)
+
+    def test_negative_budget_caps_to_one(self):
+        self.engine._vram_available_mb = 0.0
+        self.engine._vram_enabled = True
+        limit = self.engine._estimate_max_batch(300.0)
+        self.assertEqual(limit, 1)
+
+    def test_auto_unknown_duration_not_bypassed(self):
+        self.engine._attention_mode = "auto"
+        limit = self.engine._estimate_max_batch(600.0, duration_known=False)
+        self.assertLessEqual(limit, 2)
 
 
 class TestFormVramSafeBatch(unittest.TestCase):
@@ -104,6 +116,7 @@ class TestFormVramSafeBatch(unittest.TestCase):
         self.gpu = _make_mock_gpu_worker()
         self.engine = BatchEngine(self.gpu, max_batch_size=32)
         self.engine._vram_available_mb = 23034.0 * 0.8 - 5262.0
+        self.engine._vram_enabled = True
         self.engine._attention_mode = "full"
         self.engine._auto_threshold_sec = 600.0
 
@@ -148,8 +161,16 @@ class TestFormVramSafeBatch(unittest.TestCase):
         batch = self.engine._form_vram_safe_batch(reqs)
         self.assertGreater(len(batch), 0)
 
+    def test_auto_mode_unknown_files_limited(self):
+        self.engine._attention_mode = "auto"
+        reqs = [_make_pending(None) for _ in range(10)]
+        for r in reqs:
+            r.duration_sec = None
+        batch = self.engine._form_vram_safe_batch(reqs)
+        self.assertLess(len(batch), 10, "Unknown-duration files in auto mode must not batch at full size")
+
     def test_disabled_vram_uses_static_limit(self):
-        self.engine._vram_available_mb = 0.0
+        self.engine._vram_enabled = False
         reqs = [_make_pending(300.0) for _ in range(50)]
         batch = self.engine._form_vram_safe_batch(reqs)
         self.assertEqual(len(batch), 32)

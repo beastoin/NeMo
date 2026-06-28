@@ -71,8 +71,10 @@ class BatchEngine:
         self._vram_bytes_per_t2 = vram_bytes_per_t2
         self._starvation_timeout = starvation_timeout_sec
         self._vram_available_mb = 0.0
+        self._vram_enabled = False
         self._attention_mode = "full"
         self._auto_threshold_sec = 600.0
+        self._pool_size = 1
         self._pending: list[PendingRequest] = []
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
@@ -91,12 +93,20 @@ class BatchEngine:
         vram = self._gpu_worker.vram_info
         self._attention_mode = vram.get("attention_mode", "full")
         self._auto_threshold_sec = vram.get("auto_threshold_sec", 600.0)
+        self._pool_size = max(1, self._gpu_worker._pool_size) if hasattr(self._gpu_worker, '_pool_size') else 1
         if self._vram_safety_factor > 0 and vram["total_mb"] > 0:
-            self._vram_available_mb = vram["total_mb"] * self._vram_safety_factor - vram["baseline_mb"]
+            budget = vram["total_mb"] * self._vram_safety_factor - vram["baseline_mb"]
+            self._vram_available_mb = max(budget, 0) / self._pool_size
+            self._vram_enabled = True
+            if budget <= 0:
+                log.warning(
+                    f"VRAM budget is non-positive ({budget:.0f} MB) — baseline exceeds safety cap. "
+                    f"All batches will be capped to 1."
+                )
             log.info(
-                f"VRAM-aware batching enabled: {self._vram_available_mb:.0f} MB budget "
+                f"VRAM-aware batching enabled: {self._vram_available_mb:.0f} MB budget/worker "
                 f"(total={vram['total_mb']:.0f}, baseline={vram['baseline_mb']:.0f}, "
-                f"safety={self._vram_safety_factor}, coeff={self._vram_bytes_per_t2})"
+                f"safety={self._vram_safety_factor}, pool={self._pool_size}, coeff={self._vram_bytes_per_t2})"
             )
         else:
             log.info("VRAM-aware batching disabled (safety_factor=0 or no VRAM info)")
@@ -130,13 +140,15 @@ class BatchEngine:
             pass
         return None
 
-    def _estimate_max_batch(self, max_duration_sec: float) -> int:
-        if self._vram_available_mb <= 0 or max_duration_sec <= 0:
+    def _estimate_max_batch(self, max_duration_sec: float, duration_known: bool = True) -> int:
+        if not self._vram_enabled or max_duration_sec <= 0:
             return self._max_batch_size
         if self._attention_mode == "local":
             return self._max_batch_size
-        if self._attention_mode == "auto" and max_duration_sec >= self._auto_threshold_sec:
+        if self._attention_mode == "auto" and duration_known and max_duration_sec >= self._auto_threshold_sec:
             return self._max_batch_size
+        if self._vram_available_mb <= 0:
+            return 1
         T = max_duration_sec / 0.08
         per_file_mb = self._vram_bytes_per_t2 * T * T / (1024 * 1024)
         if per_file_mb <= 0:
@@ -191,8 +203,12 @@ class BatchEngine:
             if self._pending:
                 await self._flush_batch()
 
+    def _batch_limit_for(self, req: PendingRequest) -> int:
+        dur = self._effective_duration(req)
+        return self._estimate_max_batch(dur, duration_known=req.duration_sec is not None)
+
     def _form_vram_safe_batch(self, candidates: list[PendingRequest]) -> list[PendingRequest]:
-        if not candidates or self._vram_available_mb <= 0:
+        if not candidates or not self._vram_enabled:
             return candidates[: self._max_batch_size]
 
         now = time.monotonic()
@@ -201,7 +217,8 @@ class BatchEngine:
         if starved:
             anchor = min(starved, key=lambda r: r.submitted_at)
             anchor_dur = self._effective_duration(anchor)
-            limit = self._estimate_max_batch(anchor_dur)
+            any_unknown = anchor.duration_sec is None
+            limit = self._estimate_max_batch(anchor_dur, duration_known=not any_unknown)
             others = sorted(
                 [r for r in candidates if r is not anchor],
                 key=lambda r: self._effective_duration(r),
@@ -211,16 +228,20 @@ class BatchEngine:
                 if len(batch) >= limit:
                     break
                 candidate_max_dur = max(anchor_dur, self._effective_duration(req))
-                new_limit = self._estimate_max_batch(candidate_max_dur)
+                has_unknown = any_unknown or req.duration_sec is None
+                new_limit = self._estimate_max_batch(candidate_max_dur, duration_known=not has_unknown)
                 if len(batch) + 1 <= new_limit:
                     batch.append(req)
+                    any_unknown = has_unknown
             return batch
 
         sorted_candidates = sorted(candidates, key=lambda r: self._effective_duration(r))
         n = min(self._max_batch_size, len(sorted_candidates))
         while n > 1:
-            longest_dur = self._effective_duration(sorted_candidates[n - 1])
-            limit = self._estimate_max_batch(longest_dur)
+            longest = sorted_candidates[n - 1]
+            longest_dur = self._effective_duration(longest)
+            has_unknown = any(r.duration_sec is None for r in sorted_candidates[:n])
+            limit = self._estimate_max_batch(longest_dur, duration_known=not has_unknown)
             if n <= limit:
                 break
             n = max(1, limit)
@@ -231,22 +252,18 @@ class BatchEngine:
             if not self._pending:
                 return
 
-            ts_pending = [r for r in self._pending if r.timestamps]
-            no_ts_pending = [r for r in self._pending if not r.timestamps]
-
-            no_ts_batch = self._form_vram_safe_batch(no_ts_pending) if no_ts_pending else []
-            ts_batch = self._form_vram_safe_batch(ts_pending) if ts_pending else []
-
-            taken = set(id(r) for r in no_ts_batch + ts_batch)
+            batch = self._form_vram_safe_batch(self._pending)
+            taken = set(id(r) for r in batch)
             self._pending = [r for r in self._pending if id(r) not in taken]
 
-        batch = no_ts_batch + ts_batch
         if not batch:
             return
 
-        static_limit = self._max_batch_size
+        ts_batch = [r for r in batch if r.timestamps]
+        no_ts_batch = [r for r in batch if not r.timestamps]
+
         actual = len(batch)
-        if actual < static_limit and self._vram_available_mb > 0:
+        if actual < self._max_batch_size and self._vram_enabled:
             self._metrics["vram_limited_batches"] += 1
 
         self._metrics["total_batches"] += 1
