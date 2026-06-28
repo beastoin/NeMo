@@ -180,6 +180,22 @@ class TestFormVramSafeBatch(unittest.TestCase):
         batch = self.engine._form_vram_safe_batch(reqs)
         self.assertEqual(len(batch), 1)
 
+    def test_mixed_short_plus_unknown_batches_short(self):
+        short = [_make_pending(9.0) for _ in range(20)]
+        unknown = [_make_pending(None)]
+        unknown[0].duration_sec = None
+        reqs = short + unknown
+        batch = self.engine._form_vram_safe_batch(reqs)
+        self.assertGreater(len(batch), 10, "Short files should not be starved by one unknown file")
+        unknown_in_batch = [r for r in batch if r.duration_sec is None]
+        self.assertEqual(len(unknown_in_batch), 0, "Unknown file should be excluded, not included")
+
+    def test_negative_budget_caps_all_modes(self):
+        self.engine._vram_available_mb = 0.0
+        self.engine._attention_mode = "local"
+        limit = self.engine._estimate_max_batch(300.0)
+        self.assertEqual(limit, 1, "Negative budget must cap to 1 even in local mode")
+
 
 class TestEffectiveDuration(unittest.TestCase):
     def test_known_duration(self):

@@ -143,12 +143,12 @@ class BatchEngine:
     def _estimate_max_batch(self, max_duration_sec: float, duration_known: bool = True) -> int:
         if not self._vram_enabled or max_duration_sec <= 0:
             return self._max_batch_size
+        if self._vram_available_mb <= 0:
+            return 1
         if self._attention_mode == "local":
             return self._max_batch_size
         if self._attention_mode == "auto" and duration_known and max_duration_sec >= self._auto_threshold_sec:
             return self._max_batch_size
-        if self._vram_available_mb <= 0:
-            return 1
         T = max_duration_sec / 0.08
         per_file_mb = self._vram_bytes_per_t2 * T * T / (1024 * 1024)
         if per_file_mb <= 0:
@@ -244,7 +244,7 @@ class BatchEngine:
             limit = self._estimate_max_batch(longest_dur, duration_known=not has_unknown)
             if n <= limit:
                 break
-            n = max(1, limit)
+            n -= 1
         return sorted_candidates[:n]
 
     async def _flush_batch(self) -> None:
