@@ -209,7 +209,16 @@ class GPUWorker:
 
             # Process batched stream chunks
             if stream_items:
-                self._dispatch_stream_batch(stream_items)
+                try:
+                    self._dispatch_stream_batch(stream_items)
+                except Exception as exc:
+                    log.error(f"Stream batch dispatch failed: {exc}")
+                    if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
+                        self._oom_recovered_count += 1
+                        log.warning(f"OOM #{self._oom_recovered_count} in stream batch — releasing CUDA cache")
+                        torch.cuda.empty_cache()
+                    for si in stream_items:
+                        si.loop.call_soon_threadsafe(self._safe_set_exception, si.future, exc)
                 self._maybe_gc()
 
             # Process non-chunk stream items (open/close/shutdown)
@@ -617,9 +626,10 @@ class GPUWorker:
         )
 
     def _warmup_model(self, model, label: str) -> None:
+        import tempfile
+
         import numpy as np
         import soundfile as sf
-        import tempfile
 
         log.info(f"Warming up {label} model...")
         sr = 16000
@@ -644,14 +654,26 @@ class GPUWorker:
         used = (total - free) / 1024**2
         log.info(f"VRAM {stage}: {used:.0f}MiB / {total / 1024**2:.0f}MiB")
 
+    _VALID_ATTENTION_MODES = {"full", "local", "auto", "dual"}
+
     def _load_models(self) -> None:
         if self._batch_cfg.get("name"):
             attn_mode = self._batch_cfg.get("attention_mode", "full")
             pool_size = self._batch_cfg.get("model_pool_size", 1)
+            if attn_mode not in self._VALID_ATTENTION_MODES:
+                raise RuntimeError(
+                    f"Invalid attention_mode '{attn_mode}'. "
+                    f"Must be one of: {', '.join(sorted(self._VALID_ATTENTION_MODES))}"
+                )
             if attn_mode == "dual" and pool_size > 1:
                 raise RuntimeError(
                     "attention_mode='dual' is incompatible with model_pool_size > 1. "
                     "Dual mode loads two models (compiled + local) on a single GPU thread."
+                )
+            if attn_mode == "dual" and self._batch_cfg.get("prefetch", False):
+                raise RuntimeError(
+                    "attention_mode='dual' is incompatible with prefetch=true. "
+                    "Dual mode routes by audio_paths; prefetch bypasses this with audio_tensors."
                 )
 
         import nemo.collections.asr as nemo_asr
@@ -785,11 +807,11 @@ class GPUWorker:
     def _batch_transcribe_dual(self, payload: dict) -> list:
         audio_paths = payload["audio_paths"]
         timestamps = payload.get("timestamps", False)
-        batch_size = payload.get("batch_size", len(audio_paths))
+
+        durations = [self._get_audio_duration_sec(p) for p in audio_paths]
 
         if self._max_file_duration_sec > 0:
-            for path in audio_paths:
-                dur = self._get_audio_duration_sec(path)
+            for i, dur in enumerate(durations):
                 if dur > self._max_file_duration_sec:
                     raise RuntimeError(
                         f"Audio file {dur:.0f}s exceeds max_file_duration_sec "
@@ -798,8 +820,7 @@ class GPUWorker:
 
         compiled_indices = []
         local_indices = []
-        for i, path in enumerate(audio_paths):
-            dur = self._get_audio_duration_sec(path)
+        for i, dur in enumerate(durations):
             if dur <= 0.0 or dur >= self._attn_auto_threshold_sec:
                 local_indices.append(i)
             else:
@@ -829,7 +850,7 @@ class GPUWorker:
             sub_results = self._batch_transcribe_with_model(self._batch_model_local, sub_payload)
             for j, idx in enumerate(local_indices):
                 results[idx] = sub_results[j]
-            unknown_count = sum(1 for i in local_indices if self._get_audio_duration_sec(audio_paths[i]) <= 0.0)
+            unknown_count = sum(1 for i in local_indices if durations[i] <= 0.0)
             log.info(
                 f"Dual-route: {len(local_indices)} files → local model"
                 f"{f' ({unknown_count} unknown duration)' if unknown_count else ''}"
@@ -840,11 +861,13 @@ class GPUWorker:
     def _get_audio_duration_sec(self, path: str) -> float:
         try:
             import torchaudio
+
             info = torchaudio.info(path)
             return info.num_frames / info.sample_rate
         except Exception as exc:
             try:
                 import wave
+
                 with wave.open(path) as wf:
                     return wf.getnframes() / wf.getframerate()
             except Exception:

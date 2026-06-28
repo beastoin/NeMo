@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 from gpu_worker import GPUWorker
@@ -17,12 +17,16 @@ class FakeModel:
         self.name = name
         self.transcribe_calls = []
 
-    def transcribe(self, audio_input, batch_size=1, timestamps=False, return_hypotheses=False, num_workers=0, verbose=False):
-        self.transcribe_calls.append({
-            "audio_input": audio_input,
-            "batch_size": batch_size,
-            "timestamps": timestamps,
-        })
+    def transcribe(
+        self, audio_input, batch_size=1, timestamps=False, return_hypotheses=False, num_workers=0, verbose=False
+    ):
+        self.transcribe_calls.append(
+            {
+                "audio_input": audio_input,
+                "batch_size": batch_size,
+                "timestamps": timestamps,
+            }
+        )
         return [f"result_{self.name}_{i}" for i in range(len(audio_input))]
 
     def eval(self):
@@ -56,8 +60,10 @@ class TestDualModelRouting(unittest.TestCase):
 
     def _patch_durations(self, duration_map):
         """Patch _get_audio_duration_sec to return durations from a dict."""
+
         def get_dur(path):
             return duration_map.get(path, 0.0)
+
         return patch.object(self.w, '_get_audio_duration_sec', side_effect=get_dur)
 
     def test_all_short_files_use_compiled(self):
@@ -219,6 +225,31 @@ class TestDualModeConfig(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             w._load_models()
         self.assertIn("incompatible with model_pool_size", str(ctx.exception))
+
+    def test_dual_with_prefetch_raises(self):
+        w = GPUWorker()
+        w._batch_cfg = {
+            "name": "nvidia/parakeet-tdt-0.6b-v3",
+            "attention_mode": "dual",
+            "prefetch": True,
+            "device": "cuda:0",
+        }
+        w._stream_cfg = {}
+        with self.assertRaises(RuntimeError) as ctx:
+            w._load_models()
+        self.assertIn("incompatible with prefetch", str(ctx.exception))
+
+    def test_invalid_attention_mode_raises(self):
+        w = GPUWorker()
+        w._batch_cfg = {
+            "name": "nvidia/parakeet-tdt-0.6b-v3",
+            "attention_mode": "bogus",
+            "device": "cuda:0",
+        }
+        w._stream_cfg = {}
+        with self.assertRaises(RuntimeError) as ctx:
+            w._load_models()
+        self.assertIn("Invalid attention_mode", str(ctx.exception))
 
 
 class TestAttentionInfo(unittest.TestCase):
