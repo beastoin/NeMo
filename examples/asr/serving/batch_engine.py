@@ -206,10 +206,14 @@ class BatchEngine:
                 self._metrics["total_requests"] += 1
 
                 pending_count = len(self._pending)
-                vram_limit = self._estimate_max_batch(
-                    max(self._effective_duration(r) for r in self._pending),
-                    duration_known=all(r.duration_sec is not None for r in self._pending),
-                ) if self._vram_enabled and self._pending else self._max_batch_size
+                vram_limit = (
+                    self._estimate_max_batch(
+                        max(self._effective_duration(r) for r in self._pending),
+                        duration_known=all(r.duration_sec is not None for r in self._pending),
+                    )
+                    if self._vram_enabled and self._pending
+                    else self._max_batch_size
+                )
                 if pending_count >= min(self._max_batch_size, vram_limit) and not self._flush_pending:
                     self._flush_pending = True
                     asyncio.create_task(self._guarded_flush())

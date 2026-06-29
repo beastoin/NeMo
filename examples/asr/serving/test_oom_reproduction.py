@@ -123,8 +123,7 @@ class TestOOMReproduction(unittest.TestCase):
 
             async def run():
                 tasks = [
-                    asyncio.create_task(engine.submit(f"/tmp/repro290/audio_{i:02d}.wav"))
-                    for i in range(FILE_COUNT)
+                    asyncio.create_task(engine.submit(f"/tmp/repro290/audio_{i:02d}.wav")) for i in range(FILE_COUNT)
                 ]
                 return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -134,10 +133,7 @@ class TestOOMReproduction(unittest.TestCase):
             loop.close()
 
         failures = [r for r in results if isinstance(r, Exception)]
-        self.assertEqual(
-            len(failures), FILE_COUNT,
-            f"Expected all {FILE_COUNT} to fail, got {len(failures)}"
-        )
+        self.assertEqual(len(failures), FILE_COUNT, f"Expected all {FILE_COUNT} to fail, got {len(failures)}")
         for f in failures:
             self.assertIn("CUDA out of memory", str(f))
 
@@ -157,8 +153,7 @@ class TestOOMReproduction(unittest.TestCase):
 
             async def run():
                 tasks = [
-                    asyncio.create_task(engine.submit(f"/tmp/repro290/audio_{i:02d}.wav"))
-                    for i in range(FILE_COUNT)
+                    asyncio.create_task(engine.submit(f"/tmp/repro290/audio_{i:02d}.wav")) for i in range(FILE_COUNT)
                 ]
                 return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -171,8 +166,9 @@ class TestOOMReproduction(unittest.TestCase):
         successes = [r for r in results if not isinstance(r, Exception)]
 
         self.assertEqual(
-            len(successes), FILE_COUNT,
-            f"Expected all {FILE_COUNT} to succeed, got {len(failures)} failures: {failures}"
+            len(successes),
+            FILE_COUNT,
+            f"Expected all {FILE_COUNT} to succeed, got {len(failures)} failures: {failures}",
         )
 
         metrics = engine.metrics
@@ -204,12 +200,12 @@ class TestOOMReproduction(unittest.TestCase):
         available = L4_TOTAL_MB - L4_BASELINE_MB
 
         self.assertGreater(
-            total_needed, L4_TOTAL_MB,
-            f"12 x 290s should exceed L4: {total_needed:.0f} > {L4_TOTAL_MB} MiB"
+            total_needed, L4_TOTAL_MB, f"12 x 290s should exceed L4: {total_needed:.0f} > {L4_TOTAL_MB} MiB"
         )
         self.assertGreater(
-            FILE_COUNT * per_file, available,
-            f"12 x {per_file:.0f} = {FILE_COUNT * per_file:.0f} > {available:.0f} available"
+            FILE_COUNT * per_file,
+            available,
+            f"12 x {per_file:.0f} = {FILE_COUNT * per_file:.0f} > {available:.0f} available",
         )
 
     @patch.object(BatchEngine, '_get_audio_duration', return_value=FILE_DURATION_SEC)
@@ -222,10 +218,7 @@ class TestOOMReproduction(unittest.TestCase):
             loop.run_until_complete(engine.start())
 
             async def run():
-                tasks = [
-                    asyncio.create_task(engine.submit(f"/tmp/audio_{i}.wav"))
-                    for i in range(FILE_COUNT)
-                ]
+                tasks = [asyncio.create_task(engine.submit(f"/tmp/audio_{i}.wav")) for i in range(FILE_COUNT)]
                 return await asyncio.gather(*tasks, return_exceptions=True)
 
             results = loop.run_until_complete(run())
