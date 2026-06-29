@@ -197,6 +197,176 @@ class TestFormVramSafeBatch(unittest.TestCase):
         self.assertEqual(limit, 1, "Negative budget must cap to 1 even in local mode")
 
 
+class TestConcurrentFlush(unittest.TestCase):
+    """Tests for concurrent batch flushing (inflight semaphore, fire-and-forget)."""
+
+    def _make_engine_with_mock(self, max_inflight=2, batch_wait=0.01):
+        gpu = _make_mock_gpu_worker()
+        gpu._pool_size = 1
+        engine = BatchEngine(
+            gpu,
+            max_batch_size=4,
+            max_wait_seconds=batch_wait,
+            max_queue_depth=4096,
+            vram_safety_factor=0.0,
+            max_inflight=max_inflight,
+        )
+        return gpu, engine
+
+    def test_inflight_semaphore_bounds_concurrent_gpu_calls(self):
+        """Verify at most max_inflight batches run on GPU simultaneously."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=1)
+        concurrent_count = {"current": 0, "peak": 0}
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            concurrent_count["current"] += 1
+            concurrent_count["peak"] = max(concurrent_count["peak"], concurrent_count["current"])
+
+            def resolve():
+                concurrent_count["current"] -= 1
+                results = [{"text": f"ok_{i}"} for i in range(work["batch_size"])]
+                if not future.done():
+                    future.set_result(results)
+
+            loop.call_soon(resolve)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(8)]
+                    return await asyncio.gather(*tasks, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 8)
+        self.assertLessEqual(concurrent_count["peak"], 1, "max_inflight=1 should limit to 1 concurrent GPU call")
+
+    def test_stop_drains_inflight_batches(self):
+        """stop() should wait for all inflight batches to complete."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=2)
+        completed = {"count": 0}
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            results = [{"text": "ok"} for _ in range(work["batch_size"])]
+
+            def resolve():
+                completed["count"] += 1
+                if not future.done():
+                    future.set_result(results)
+
+            loop.call_soon(resolve)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(4)]
+                    return await asyncio.gather(*tasks, return_exceptions=True)
+
+            loop.run_until_complete(run())
+            loop.run_until_complete(engine.stop())
+        finally:
+            loop.close()
+
+        self.assertGreater(completed["count"], 0, "GPU worker should have been called")
+
+    def test_flush_loop_fires_without_blocking(self):
+        """flush_loop creates tasks without awaiting them (fire-and-forget)."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=2, batch_wait=0.005)
+        flush_calls = {"count": 0}
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            flush_calls["count"] += 1
+            results = [{"text": "ok"} for _ in range(work["batch_size"])]
+            loop.call_soon(future.set_result, results)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(4)]
+                    await asyncio.sleep(0.05)
+                    return await asyncio.gather(*tasks, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 4)
+
+    def test_queue_full_rejects_at_limit(self):
+        """Requests beyond max_queue_depth are rejected with QueueFullError."""
+        from batch_engine import QueueFullError
+
+        gpu, engine = self._make_engine_with_mock(max_inflight=1)
+        engine._max_queue_depth = 2
+
+        never_resolve_futures = []
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            never_resolve_futures.append(future)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    engine._max_wait_seconds = 999
+                    t1 = asyncio.create_task(engine.submit("/tmp/a0.wav"))
+                    t2 = asyncio.create_task(engine.submit("/tmp/a1.wav"))
+                    await asyncio.sleep(0.01)
+                    try:
+                        await engine.submit("/tmp/a2.wav")
+                        return None
+                    except QueueFullError as e:
+                        return e
+
+            result = loop.run_until_complete(run())
+        finally:
+            for f in never_resolve_futures:
+                if not f.done():
+                    f.set_result([])
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        self.assertIsNotNone(result, "Third submit should raise QueueFullError")
+        self.assertIn("Queue depth", str(result))
+
+
 class TestEffectiveDuration(unittest.TestCase):
     def test_known_duration(self):
         engine = BatchEngine(_make_mock_gpu_worker())

@@ -57,11 +57,12 @@ class BatchEngine:
         self,
         gpu_worker: GPUWorker,
         max_batch_size: int = 32,
-        max_wait_seconds: float = 0.1,
-        max_queue_depth: int = 256,
+        max_wait_seconds: float = 0.002,
+        max_queue_depth: int = 4096,
         vram_safety_factor: float = 0.8,
         vram_bytes_per_t2: float = 136.6,
         starvation_timeout_sec: float = 5.0,
+        max_inflight: int = 2,
     ):
         self._gpu_worker = gpu_worker
         self._max_batch_size = max_batch_size
@@ -70,6 +71,7 @@ class BatchEngine:
         self._vram_safety_factor = vram_safety_factor
         self._vram_bytes_per_t2 = vram_bytes_per_t2
         self._starvation_timeout = starvation_timeout_sec
+        self._max_inflight = max_inflight
         self._vram_available_mb = 0.0
         self._vram_enabled = False
         self._attention_mode = "full"
@@ -78,6 +80,7 @@ class BatchEngine:
         self._pending: list[PendingRequest] = []
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
+        self._inflight_sem: Optional[asyncio.Semaphore] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutting_down = False
         self._metrics = {
@@ -90,6 +93,7 @@ class BatchEngine:
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._inflight_sem = asyncio.Semaphore(self._max_inflight)
         vram = self._gpu_worker.vram_info
         self._attention_mode = vram.get("attention_mode", "full")
         self._auto_threshold_sec = vram.get("auto_threshold_sec", 600.0)
@@ -115,12 +119,18 @@ class BatchEngine:
     async def stop(self) -> None:
         self._shutting_down = True
         if self._flush_task:
+            self._flush_task.cancel()
             try:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
+        # Drain remaining requests
         while self._pending:
             await self._flush_batch()
+        # Wait for all inflight batches to complete
+        if self._inflight_sem:
+            for _ in range(self._max_inflight):
+                await self._inflight_sem.acquire()
 
     @staticmethod
     def _get_audio_duration(path: str) -> Optional[float]:
@@ -187,7 +197,12 @@ class BatchEngine:
                 enqueued = True
                 self._metrics["total_requests"] += 1
 
-                if len(self._pending) >= self._max_batch_size:
+                pending_count = len(self._pending)
+                vram_limit = self._estimate_max_batch(
+                    max(self._effective_duration(r) for r in self._pending),
+                    duration_known=all(r.duration_sec is not None for r in self._pending),
+                ) if self._vram_enabled and self._pending else self._max_batch_size
+                if pending_count >= min(self._max_batch_size, vram_limit):
                     asyncio.create_task(self._flush_batch())
         except BaseException:
             if owns_file and not enqueued:
@@ -197,11 +212,15 @@ class BatchEngine:
         return await future
 
     async def _flush_loop(self) -> None:
-        """Periodically flush partial batches."""
+        """Periodically flush partial batches.
+
+        Batches are dispatched as fire-and-forget tasks capped by _inflight_sem
+        so the next batch can form while the GPU processes the current one.
+        """
         while not self._shutting_down:
             await asyncio.sleep(self._max_wait_seconds)
             if self._pending:
-                await self._flush_batch()
+                asyncio.create_task(self._flush_batch())
 
     def _batch_limit_for(self, req: PendingRequest) -> int:
         dur = self._effective_duration(req)
@@ -259,9 +278,6 @@ class BatchEngine:
         if not batch:
             return
 
-        ts_batch = [r for r in batch if r.timestamps]
-        no_ts_batch = [r for r in batch if not r.timestamps]
-
         actual = len(batch)
         if actual < self._max_batch_size and self._vram_enabled:
             self._metrics["vram_limited_batches"] += 1
@@ -269,17 +285,19 @@ class BatchEngine:
         self._metrics["total_batches"] += 1
         self._metrics["total_files"] += actual
 
+        any_ts = any(r.timestamps for r in batch)
         durations = [self._effective_duration(r) for r in batch]
         max_dur = max(durations) if durations else 0
         log.info(
-            f"Flushing batch: {actual} files (ts={len(ts_batch)}, no_ts={len(no_ts_batch)}, "
-            f"max_dur={max_dur:.1f}s, limit={self._estimate_max_batch(max_dur)})"
+            f"Flushing batch: {actual} files "
+            f"(max_dur={max_dur:.1f}s, limit={self._estimate_max_batch(max_dur)})"
         )
 
-        for sub_batch, timestamps in [(no_ts_batch, False), (ts_batch, True)]:
-            if not sub_batch:
-                continue
-            await self._run_sub_batch(sub_batch, timestamps)
+        await self._inflight_sem.acquire()
+        try:
+            await self._run_sub_batch(batch, any_ts)
+        finally:
+            self._inflight_sem.release()
 
     @staticmethod
     def _serialize_result(result: Any, audio_path: str, timestamps: bool) -> dict:
