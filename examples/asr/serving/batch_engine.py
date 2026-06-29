@@ -210,8 +210,9 @@ class BatchEngine:
                     max(self._effective_duration(r) for r in self._pending),
                     duration_known=all(r.duration_sec is not None for r in self._pending),
                 ) if self._vram_enabled and self._pending else self._max_batch_size
-                if pending_count >= min(self._max_batch_size, vram_limit):
-                    asyncio.create_task(self._flush_batch())
+                if pending_count >= min(self._max_batch_size, vram_limit) and not self._flush_pending:
+                    self._flush_pending = True
+                    asyncio.create_task(self._guarded_flush())
         except BaseException:
             if owns_file and not enqueued:
                 self._unlink_safe(audio_path)
@@ -293,6 +294,9 @@ class BatchEngine:
                 batch = self._form_vram_safe_batch(self._pending)
                 taken = set(id(r) for r in batch)
                 self._pending = [r for r in self._pending if id(r) not in taken]
+
+            # Allow new flush to be scheduled now that we've dequeued
+            self._flush_pending = False
 
             if not batch:
                 return

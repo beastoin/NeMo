@@ -529,6 +529,13 @@ class GPUWorker:
         self._attn_auto_threshold_sec = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
         self._max_file_duration_sec = self._batch_cfg.get("max_file_duration_sec", 0)
 
+        if self._attn_mode == "auto" and self._pool_size > 1:
+            log.warning(
+                f"Auto attention mode is unsafe with model_pool_size={self._pool_size} "
+                f"(shared mutable state). Falling back to full attention mode."
+            )
+            self._attn_mode = "full"
+
         if self._attn_mode == "local":
             model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
             model.change_subsampling_conv_chunking_factor(1)
