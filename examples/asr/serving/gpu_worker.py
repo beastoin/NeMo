@@ -85,10 +85,21 @@ class GPUWorker:
         self._attn_is_local = False
         self._max_file_duration_sec = 0
         self._raw_batch_model = None
+        self._vram_total_mb = 0.0
+        self._vram_baseline_mb = 0.0
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set() and self._load_error is None
+
+    @property
+    def vram_info(self) -> dict:
+        return {
+            "total_mb": self._vram_total_mb,
+            "baseline_mb": self._vram_baseline_mb,
+            "attention_mode": self._attn_mode,
+            "auto_threshold_sec": self._attn_auto_threshold_sec,
+        }
 
     def start(self, batch_cfg: dict, stream_cfg: dict) -> None:
         self._batch_cfg = batch_cfg
@@ -518,6 +529,13 @@ class GPUWorker:
         self._attn_auto_threshold_sec = self._batch_cfg.get("auto_local_attn_threshold_sec", 600)
         self._max_file_duration_sec = self._batch_cfg.get("max_file_duration_sec", 0)
 
+        if self._attn_mode == "auto" and self._pool_size > 1:
+            log.warning(
+                f"Auto attention mode is unsafe with model_pool_size={self._pool_size} "
+                f"(shared mutable state). Falling back to full attention mode."
+            )
+            self._attn_mode = "full"
+
         if self._attn_mode == "local":
             model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
             model.change_subsampling_conv_chunking_factor(1)
@@ -572,11 +590,17 @@ class GPUWorker:
         else:
             log.info("No batch model configured, batch transcription will be unavailable")
 
-        vram_used = torch.cuda.memory_allocated() / 1024**2
-        vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
-        log.info(f"VRAM after model load: {vram_used:.0f}MiB / {vram_total:.0f}MiB")
-
         self._build_stream_pipeline()
+
+        device = self._batch_cfg.get("device", "cuda:0") if self._batch_cfg.get("name") else "cuda:0"
+        dev_idx = int(device.split(":")[-1]) if ":" in device else 0
+        free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+        self._vram_total_mb = total_bytes / (1024 * 1024)
+        self._vram_baseline_mb = (total_bytes - free_bytes) / (1024 * 1024)
+        log.info(
+            f"VRAM after all models: {self._vram_baseline_mb:.0f}MiB used / "
+            f"{self._vram_total_mb:.0f}MiB total ({free_bytes / (1024 * 1024):.0f}MiB free)"
+        )
 
         if self._batch_model is None and self._stream_pipeline is None:
             raise RuntimeError("No models loaded — configure batch_model and/or stream_model")
@@ -673,11 +697,13 @@ class GPUWorker:
     def _get_audio_duration_sec(self, path: str) -> float:
         try:
             import torchaudio
+
             info = torchaudio.info(path)
             return info.num_frames / info.sample_rate
         except Exception as exc:
             try:
                 import wave
+
                 with wave.open(path) as wf:
                     return wf.getnframes() / wf.getframerate()
             except Exception:
@@ -715,11 +741,17 @@ class GPUWorker:
                             f"set attention_mode: local/auto for longer audio."
                         )
 
-        if self._attn_mode == "auto" and isinstance(audio_input, list):
-            max_dur = max(
-                (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
-                default=0.0,
-            )
+        if self._attn_mode == "auto":
+            durations_from_batcher = payload.get("durations")
+            if durations_from_batcher:
+                max_dur = max(durations_from_batcher)
+            elif isinstance(audio_input, list):
+                max_dur = max(
+                    (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
+                    default=0.0,
+                )
+            else:
+                max_dur = 0.0
             need_local = max_dur >= self._attn_auto_threshold_sec
             if need_local != self._attn_is_local:
                 mode_name = "local" if need_local else "full"
