@@ -734,11 +734,17 @@ class GPUWorker:
                             f"set attention_mode: local/auto for longer audio."
                         )
 
-        if self._attn_mode == "auto" and isinstance(audio_input, list):
-            max_dur = max(
-                (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
-                default=0.0,
-            )
+        if self._attn_mode == "auto":
+            durations_from_batcher = payload.get("durations")
+            if durations_from_batcher:
+                max_dur = max(durations_from_batcher)
+            elif isinstance(audio_input, list):
+                max_dur = max(
+                    (self._get_audio_duration_sec(p) for p in audio_input if isinstance(p, str)),
+                    default=0.0,
+                )
+            else:
+                max_dur = 0.0
             need_local = max_dur >= self._attn_auto_threshold_sec
             if need_local != self._attn_is_local:
                 mode_name = "local" if need_local else "full"

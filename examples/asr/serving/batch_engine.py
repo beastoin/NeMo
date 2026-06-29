@@ -81,6 +81,7 @@ class BatchEngine:
         self._pending: list[PendingRequest] = []
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
+        self._flush_pending = False
         self._inflight_sem: Optional[asyncio.Semaphore] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutting_down = False
@@ -99,6 +100,12 @@ class BatchEngine:
         self._attention_mode = vram.get("attention_mode", "full")
         self._auto_threshold_sec = vram.get("auto_threshold_sec", 600.0)
         self._pool_size = max(1, self._gpu_worker._pool_size) if hasattr(self._gpu_worker, '_pool_size') else 1
+        if self._attention_mode == "auto" and self._pool_size > 1:
+            log.warning(
+                "Auto attention mode is unsafe with model_pool_size > 1 (shared mutable state). "
+                "Falling back to full attention mode for VRAM estimation."
+            )
+            self._attention_mode = "full"
         if self._vram_safety_factor > 0 and vram["total_mb"] > 0:
             budget = vram["total_mb"] * self._vram_safety_factor - vram["baseline_mb"]
             self._vram_available_mb = max(budget, 0) / self._pool_size
@@ -217,11 +224,14 @@ class BatchEngine:
 
         Batches are dispatched as fire-and-forget tasks capped by _inflight_sem
         so the next batch can form while the GPU processes the current one.
+        Only one flush task is scheduled at a time to prevent unbounded task
+        accumulation behind a saturated semaphore.
         """
         while not self._shutting_down:
             await asyncio.sleep(self._max_wait_seconds)
-            if self._pending:
-                asyncio.create_task(self._flush_batch())
+            if self._pending and not self._flush_pending:
+                self._flush_pending = True
+                asyncio.create_task(self._guarded_flush())
 
     def _batch_limit_for(self, req: PendingRequest) -> int:
         dur = self._effective_duration(req)
@@ -266,6 +276,12 @@ class BatchEngine:
                 break
             n -= 1
         return sorted_candidates[:n]
+
+    async def _guarded_flush(self) -> None:
+        try:
+            await self._flush_batch()
+        finally:
+            self._flush_pending = False
 
     async def _flush_batch(self) -> None:
         await self._inflight_sem.acquire()
@@ -346,6 +362,7 @@ class BatchEngine:
 
     async def _run_sub_batch(self, batch: list[PendingRequest], timestamps: bool) -> None:
         audio_paths = [r.audio_path for r in batch]
+        durations = [self._effective_duration(r) for r in batch]
         try:
             gpu_future = self._gpu_worker.submit(
                 WorkType.BATCH_TRANSCRIBE,
@@ -353,6 +370,7 @@ class BatchEngine:
                     "audio_paths": audio_paths,
                     "timestamps": timestamps,
                     "batch_size": len(batch),
+                    "durations": durations,
                 },
                 self._loop,
             )

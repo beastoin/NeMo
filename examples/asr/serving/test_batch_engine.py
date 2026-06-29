@@ -493,6 +493,123 @@ class TestConcurrentFlush(unittest.TestCase):
         self.assertEqual(len(successes), 2)
 
 
+class TestFlushGuard(unittest.TestCase):
+    """Tests for the guarded flush (no unbounded task accumulation)."""
+
+    def test_no_duplicate_flush_tasks(self):
+        """Only one flush task should be pending at a time."""
+        gpu = _make_mock_gpu_worker()
+        gpu._pool_size = 1
+        engine = BatchEngine(gpu, max_batch_size=4, max_wait_seconds=0.005, vram_safety_factor=0.0, max_inflight=1)
+
+        gate = asyncio.Event()
+        flush_entries = {"count": 0}
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            flush_entries["count"] += 1
+
+            async def wait_and_resolve():
+                await gate.wait()
+                if not future.done():
+                    future.set_result([{"text": "ok"} for _ in range(work["batch_size"])])
+
+            asyncio.ensure_future(wait_and_resolve())
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(8)]
+                    await asyncio.sleep(0.1)
+                    pending_before = flush_entries["count"]
+                    self.assertLessEqual(pending_before, 2, "Should not accumulate unbounded flush tasks")
+                    gate.set()
+                    return await asyncio.gather(*tasks, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 8)
+
+
+class TestAutoPoolFallback(unittest.TestCase):
+    """Auto attention mode falls back to full when pool_size > 1."""
+
+    def test_auto_with_pool_falls_back(self):
+        gpu = _make_mock_gpu_worker(attention_mode="auto")
+        gpu._pool_size = 2
+        engine = BatchEngine(gpu, max_batch_size=32, vram_safety_factor=0.8)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+            self.assertEqual(engine._attention_mode, "full", "Auto mode should fall back to full with pool>1")
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+    def test_auto_with_single_pool_stays_auto(self):
+        gpu = _make_mock_gpu_worker(attention_mode="auto")
+        gpu._pool_size = 1
+        engine = BatchEngine(gpu, max_batch_size=32, vram_safety_factor=0.8)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+            self.assertEqual(engine._attention_mode, "auto", "Auto mode should stay with pool=1")
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+
+class TestDurationsInPayload(unittest.TestCase):
+    """Durations are passed through the payload to GPU worker."""
+
+    def test_run_sub_batch_includes_durations(self):
+        gpu = _make_mock_gpu_worker()
+        gpu._pool_size = 1
+        engine = BatchEngine(gpu, max_batch_size=4, vram_safety_factor=0.0, max_inflight=2)
+
+        submitted_payloads = []
+
+        def mock_submit(work_type, work, loop):
+            submitted_payloads.append(work)
+            future = loop.create_future()
+            future.set_result([{"text": "ok"} for _ in range(work["batch_size"])])
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=10.0):
+                    t1 = asyncio.create_task(engine.submit("/tmp/a.wav"))
+                    t2 = asyncio.create_task(engine.submit("/tmp/b.wav"))
+                    return await asyncio.gather(t1, t2, return_exceptions=True)
+
+            loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        self.assertGreaterEqual(len(submitted_payloads), 1)
+        payload = submitted_payloads[0]
+        self.assertIn("durations", payload, "Payload must include durations")
+        self.assertTrue(all(d > 0 for d in payload["durations"]), "All durations should be positive")
+
+
 class TestEffectiveDuration(unittest.TestCase):
     def test_known_duration(self):
         engine = BatchEngine(_make_mock_gpu_worker())
