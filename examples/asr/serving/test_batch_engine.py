@@ -366,8 +366,8 @@ class TestConcurrentFlush(unittest.TestCase):
         self.assertIsNotNone(result, "Third submit should raise QueueFullError")
         self.assertIn("Queue depth", str(result))
 
-    def test_mixed_timestamps_no_leak(self):
-        """Non-timestamp request must not receive timestamp data when batched with timestamp request."""
+    def test_mixed_timestamps_no_leak_object_path(self):
+        """Non-timestamp request must not receive timestamp data (object result path)."""
         gpu, engine = self._make_engine_with_mock(max_inflight=2, batch_wait=0.01)
         engine._max_batch_size = 2
 
@@ -405,6 +405,44 @@ class TestConcurrentFlush(unittest.TestCase):
         self.assertNotIsInstance(ts_result, Exception)
         self.assertNotIn("word", no_ts_result, "Non-timestamp request must not receive timestamp data")
         self.assertIn("word", ts_result, "Timestamp request must receive timestamp data")
+
+    def test_mixed_timestamps_no_leak_dict_path(self):
+        """Non-timestamp request must not receive timestamp data (dict result path — production GPUWorker shape)."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=2, batch_wait=0.01)
+        engine._max_batch_size = 2
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            results = [
+                {"text": f"text_{i}", "timestamp": {"word": [{"word": "hello", "start": 0.0, "end": 0.5}]}}
+                for i in range(work["batch_size"])
+            ]
+            loop.call_soon(future.set_result, results)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    t_no_ts = asyncio.create_task(engine.submit("/tmp/no_ts_d.wav", timestamps=False))
+                    t_ts = asyncio.create_task(engine.submit("/tmp/ts_d.wav", timestamps=True))
+                    return await asyncio.gather(t_no_ts, t_ts, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        no_ts_result, ts_result = results[0], results[1]
+        self.assertNotIsInstance(no_ts_result, Exception)
+        self.assertNotIsInstance(ts_result, Exception)
+        self.assertNotIn("timestamp", no_ts_result, "Dict-path: non-ts request must not receive timestamp")
+        self.assertIn("timestamp", ts_result, "Dict-path: ts request must receive timestamp")
 
     def test_semaphore_before_dequeue(self):
         """Requests stay in _pending until a semaphore slot is available."""

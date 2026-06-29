@@ -305,6 +305,8 @@ class BatchEngine:
         output = {"audio_path": audio_path}
         if isinstance(result, dict) and "text" in result:
             output.update(result)
+            if not timestamps:
+                output.pop("timestamp", None)
             return output
         elif hasattr(result, 'text'):
             output["text"] = result.text
