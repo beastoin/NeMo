@@ -63,6 +63,7 @@ class BatchEngine:
         vram_bytes_per_t2: float = 136.6,
         starvation_timeout_sec: float = 5.0,
         max_inflight: int = 2,
+        **kwargs,
     ):
         self._gpu_worker = gpu_worker
         self._max_batch_size = max_batch_size
