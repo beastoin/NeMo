@@ -267,34 +267,34 @@ class BatchEngine:
         return sorted_candidates[:n]
 
     async def _flush_batch(self) -> None:
-        async with self._lock:
-            if not self._pending:
-                return
-
-            batch = self._form_vram_safe_batch(self._pending)
-            taken = set(id(r) for r in batch)
-            self._pending = [r for r in self._pending if id(r) not in taken]
-
-        if not batch:
-            return
-
-        actual = len(batch)
-        if actual < self._max_batch_size and self._vram_enabled:
-            self._metrics["vram_limited_batches"] += 1
-
-        self._metrics["total_batches"] += 1
-        self._metrics["total_files"] += actual
-
-        any_ts = any(r.timestamps for r in batch)
-        durations = [self._effective_duration(r) for r in batch]
-        max_dur = max(durations) if durations else 0
-        log.info(
-            f"Flushing batch: {actual} files "
-            f"(max_dur={max_dur:.1f}s, limit={self._estimate_max_batch(max_dur)})"
-        )
-
         await self._inflight_sem.acquire()
         try:
+            async with self._lock:
+                if not self._pending:
+                    return
+
+                batch = self._form_vram_safe_batch(self._pending)
+                taken = set(id(r) for r in batch)
+                self._pending = [r for r in self._pending if id(r) not in taken]
+
+            if not batch:
+                return
+
+            actual = len(batch)
+            if actual < self._max_batch_size and self._vram_enabled:
+                self._metrics["vram_limited_batches"] += 1
+
+            self._metrics["total_batches"] += 1
+            self._metrics["total_files"] += actual
+
+            any_ts = any(r.timestamps for r in batch)
+            durations = [self._effective_duration(r) for r in batch]
+            max_dur = max(durations) if durations else 0
+            log.info(
+                f"Flushing batch: {actual} files "
+                f"(max_dur={max_dur:.1f}s, limit={self._estimate_max_batch(max_dur)})"
+            )
+
             await self._run_sub_batch(batch, any_ts)
         finally:
             self._inflight_sem.release()
@@ -358,13 +358,13 @@ class BatchEngine:
             if isinstance(results, list) and len(results) == len(batch):
                 for req, result in zip(batch, results):
                     if not req.future.done():
-                        req.future.set_result(self._serialize_result(result, req.audio_path, timestamps))
+                        req.future.set_result(self._serialize_result(result, req.audio_path, req.timestamps))
             else:
                 text_results = results if isinstance(results, list) else [results]
                 for i, req in enumerate(batch):
                     if not req.future.done():
                         result = text_results[i] if i < len(text_results) else ""
-                        req.future.set_result(self._serialize_result(result, req.audio_path, timestamps))
+                        req.future.set_result(self._serialize_result(result, req.audio_path, req.timestamps))
 
         except RuntimeError as exc:
             if "GPU queue full" in str(exc):

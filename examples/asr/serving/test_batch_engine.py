@@ -366,6 +366,94 @@ class TestConcurrentFlush(unittest.TestCase):
         self.assertIsNotNone(result, "Third submit should raise QueueFullError")
         self.assertIn("Queue depth", str(result))
 
+    def test_mixed_timestamps_no_leak(self):
+        """Non-timestamp request must not receive timestamp data when batched with timestamp request."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=2, batch_wait=0.01)
+        engine._max_batch_size = 2
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            results = []
+            for i in range(work["batch_size"]):
+                r = MagicMock()
+                r.text = f"text_{i}"
+                r.timestamp = {"word": [{"word": "hello", "start": 0.0, "end": 0.5}]}
+                results.append(r)
+            loop.call_soon(future.set_result, results)
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    t_no_ts = asyncio.create_task(engine.submit("/tmp/no_ts.wav", timestamps=False))
+                    t_ts = asyncio.create_task(engine.submit("/tmp/ts.wav", timestamps=True))
+                    return await asyncio.gather(t_no_ts, t_ts, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        no_ts_result, ts_result = results[0], results[1]
+        self.assertNotIsInstance(no_ts_result, Exception)
+        self.assertNotIsInstance(ts_result, Exception)
+        self.assertNotIn("word", no_ts_result, "Non-timestamp request must not receive timestamp data")
+        self.assertIn("word", ts_result, "Timestamp request must receive timestamp data")
+
+    def test_semaphore_before_dequeue(self):
+        """Requests stay in _pending until a semaphore slot is available."""
+        gpu, engine = self._make_engine_with_mock(max_inflight=1, batch_wait=999)
+        engine._max_batch_size = 1
+
+        gate = asyncio.Event()
+        submitted_to_gpu = []
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            submitted_to_gpu.append(work)
+
+            async def wait_and_resolve():
+                await gate.wait()
+                if not future.done():
+                    future.set_result([{"text": "ok"}])
+
+            asyncio.ensure_future(wait_and_resolve())
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    t1 = asyncio.create_task(engine.submit("/tmp/a0.wav"))
+                    await asyncio.sleep(0.02)
+                    t2 = asyncio.create_task(engine.submit("/tmp/a1.wav"))
+                    await asyncio.sleep(0.02)
+
+                    self.assertEqual(len(submitted_to_gpu), 1, "Only 1 batch should be on GPU (semaphore=1)")
+                    self.assertGreaterEqual(len(engine._pending), 1, "Second request should still be pending")
+
+                    gate.set()
+                    return await asyncio.gather(t1, t2, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 2)
+
 
 class TestEffectiveDuration(unittest.TestCase):
     def test_known_duration(self):
