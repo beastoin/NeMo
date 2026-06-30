@@ -162,16 +162,11 @@ def _basic_wer(references, hypotheses):
 
 
 def get_wav_duration(wav_path):
-    """Get audio duration in seconds from WAV file header."""
-    with open(wav_path, "rb") as f:
-        f.read(24)  # skip to byte rate offset
-        import struct
+    """Get audio duration in seconds from WAV file."""
+    import wave
 
-        f.seek(28)
-        byte_rate = struct.unpack("<I", f.read(4))[0]
-        f.seek(40)
-        data_size = struct.unpack("<I", f.read(4))[0]
-        return data_size / byte_rate if byte_rate > 0 else 0
+    with wave.open(str(wav_path), "rb") as w:
+        return w.getnframes() / w.getframerate()
 
 
 async def transcribe_file(session, url, wav_path, semaphore):
@@ -242,7 +237,7 @@ def summarize_sweep(results, wall_time, concurrency):
         "wall_s": round(wall_time, 2),
         "rps": round(len(ok) / wall_time, 2) if wall_time > 0 else 0,
         "rtfx": round(total_audio / wall_time, 2) if wall_time > 0 else 0,
-        "rtf": round(wall_time / total_audio, 4) if total_audio > 0 else 0,
+        "rtf": round(wall_time / total_audio, 3) if total_audio > 0 else 0,
         "total_audio_s": round(total_audio, 1),
         "sess_per_min": round(len(ok) / (wall_time / 60), 1) if wall_time > 0 else 0,
     }
