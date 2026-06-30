@@ -102,11 +102,11 @@ class GPUWorker:
             "auto_threshold_sec": self._attn_auto_threshold_sec,
         }
 
-    def start(self, batch_cfg: dict, stream_cfg: dict) -> None:
-        self._batch_cfg = batch_cfg
-        self._stream_cfg = stream_cfg
+    def start(self, batch_cfg: Optional[dict] = None, stream_cfg: Optional[dict] = None) -> None:
+        self._batch_cfg = batch_cfg or {}
+        self._stream_cfg = stream_cfg or {}
         self._running = True
-        self._gc_interval = batch_cfg.get("gc_interval", 50)
+        self._gc_interval = self._batch_cfg.get("gc_interval", 50)
         self._gc_counter = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="gpu-worker")
         self._thread.start()
@@ -995,3 +995,7 @@ class GPUWorker:
             "final_text": final_text,
             "status": "closed",
         }
+
+
+class AudioDurationExceededError(RuntimeError):
+    pass
