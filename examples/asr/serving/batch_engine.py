@@ -299,9 +299,6 @@ class BatchEngine:
                 taken = set(id(r) for r in batch)
                 self._pending = [r for r in self._pending if id(r) not in taken]
 
-            # Allow new flush to be scheduled now that we've dequeued
-            self._flush_pending = False
-
             if not batch:
                 return
 
