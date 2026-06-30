@@ -79,6 +79,7 @@ class GPUWorker:
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
+        self._submit_lock = threading.Lock()
         self._attn_mode = "full"
         self._attn_auto_threshold_sec = 600
         self._attn_local_context = [128, 128]
@@ -101,11 +102,11 @@ class GPUWorker:
             "auto_threshold_sec": self._attn_auto_threshold_sec,
         }
 
-    def start(self, batch_cfg: dict, stream_cfg: dict) -> None:
-        self._batch_cfg = batch_cfg
-        self._stream_cfg = stream_cfg
+    def start(self, batch_cfg: Optional[dict] = None, stream_cfg: Optional[dict] = None) -> None:
+        self._batch_cfg = batch_cfg or {}
+        self._stream_cfg = stream_cfg or {}
         self._running = True
-        self._gc_interval = batch_cfg.get("gc_interval", 50)
+        self._gc_interval = self._batch_cfg.get("gc_interval", 50)
         self._gc_counter = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="gpu-worker")
         self._thread.start()
@@ -125,42 +126,50 @@ class GPUWorker:
             raise self._load_error
 
     def stop(self) -> None:
-        if not self._running:
-            return
+        with self._submit_lock:
+            if not self._running:
+                return
+            self._running = False
         dummy_loop = asyncio.new_event_loop()
         fut = dummy_loop.create_future()
         try:
             self._stream_queue.put(WorkItem(WorkType.SHUTDOWN, None, fut, dummy_loop), timeout=5)
         except queue.Full:
             pass
-        self._running = False
         self._thread.join(timeout=30)
         dummy_loop.close()
 
     def submit(self, work_type: WorkType, payload: Any, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
-        if not self.is_ready:
+        with self._submit_lock:
+            if not self._running:
+                fut = loop.create_future()
+                fut.set_exception(RuntimeError("GPU worker shutting down"))
+                return fut
+            if not self.is_ready:
+                fut = loop.create_future()
+                fut.set_exception(RuntimeError("GPU worker not ready"))
+                return fut
             fut = loop.create_future()
-            fut.set_exception(RuntimeError("GPU worker not ready"))
-            return fut
-        fut = loop.create_future()
-        if work_type == WorkType.BATCH_TRANSCRIBE and self._pool_size > 1:
-            idx = self._next_pool_idx % self._pool_size
-            self._next_pool_idx += 1
-            q = self._pool_queues[idx]
-        elif work_type != WorkType.BATCH_TRANSCRIBE:
-            q = self._stream_queue
-        else:
-            q = self._batch_queue
-        try:
-            q.put_nowait(WorkItem(work_type, payload, fut, loop))
-        except queue.Full:
-            fut.set_exception(RuntimeError("GPU queue full"))
+            if work_type == WorkType.BATCH_TRANSCRIBE and self._pool_size > 1:
+                idx = self._next_pool_idx % self._pool_size
+                self._next_pool_idx += 1
+                q = self._pool_queues[idx]
+            elif work_type != WorkType.BATCH_TRANSCRIBE:
+                q = self._stream_queue
+            else:
+                q = self._batch_queue
+            try:
+                q.put_nowait(WorkItem(work_type, payload, fut, loop))
+            except queue.Full:
+                fut.set_exception(RuntimeError("GPU queue full"))
         return fut
 
     def _run_loop(self) -> None:
         log.info("GPU worker thread started")
         try:
             self._load_models()
+            if self._pool_size > 1:
+                self._start_pool_workers()
             self._ready.set()
         except Exception as exc:
             log.error(f"Model loading failed: {exc}")
@@ -364,8 +373,8 @@ class GPUWorker:
                 }
             item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
 
-    def _run_pool_mode(self) -> None:
-        log.info(f"Running in pool mode: {self._pool_size} model workers")
+    def _start_pool_workers(self) -> None:
+        log.info(f"Starting pool mode: {self._pool_size} model workers")
         for i in range(self._pool_size):
             q = queue.Queue(maxsize=_MAX_GPU_QUEUE)
             self._pool_queues.append(q)
@@ -378,7 +387,7 @@ class GPUWorker:
             self._pool_threads.append(t)
             t.start()
 
-        # Main thread handles streaming only (if any)
+    def _run_pool_mode(self) -> None:
         while self._running:
             try:
                 item = self._stream_queue.get(timeout=0.1)
@@ -402,9 +411,12 @@ class GPUWorker:
         for t in self._pool_threads:
             t.join(timeout=30)
 
+        self._drain_queues(self._pool_queues + [self._stream_queue, self._batch_queue])
+
     @torch.inference_mode()
     def _pool_worker_loop(self, idx: int, model, q: queue.Queue) -> None:
         stream = torch.cuda.Stream()
+        gc_counter = 0
         log.info(f"Pool worker {idx} started (stream={stream})")
         while self._running:
             try:
@@ -420,7 +432,11 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
             finally:
-                self._maybe_gc()
+                gc.collect(0)
+                gc_counter += 1
+                if gc_counter >= self._gc_interval:
+                    gc.collect()
+                    gc_counter = 0
         log.info(f"Pool worker {idx} stopped")
 
     def _run_prefetch_mode(self) -> None:
@@ -450,38 +466,58 @@ class GPUWorker:
             finally:
                 self._maybe_gc()
 
-        self._drain_queues([self._stream_queue, self._batch_queue])
+        drain_list = [self._stream_queue, self._batch_queue]
+        if self._prefetch_queue is not None:
+            drain_list.append(self._prefetch_queue)
+        self._drain_queues(drain_list)
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=10)
+            self._drain_queues([self._prefetch_queue])
 
     def _prefetch_loop(self) -> None:
         import numpy as np
         import soundfile as sf
 
         log.info("Prefetch thread started")
-        while self._running:
-            try:
-                item = self._batch_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            if item.work_type == WorkType.SHUTDOWN:
-                self._prefetch_queue.put(item)
-                break
-
-            if item.work_type == WorkType.BATCH_TRANSCRIBE:
+        owned_item = None
+        try:
+            while self._running:
                 try:
-                    audio_arrays = []
-                    for path in item.payload["audio_paths"]:
-                        data, sr = sf.read(path, dtype='float32')
-                        if sr != 16000:
-                            import librosa
+                    owned_item = self._batch_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-                            data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-                        audio_arrays.append(np.array(data, dtype=np.float32))
-                    item.payload["audio_tensors"] = audio_arrays
-                except Exception as exc:
-                    log.warning(f"Prefetch failed, falling back to paths: {exc}")
+                if owned_item.work_type == WorkType.SHUTDOWN:
+                    self._prefetch_queue.put(owned_item)
+                    owned_item = None
+                    break
 
-            self._prefetch_queue.put(item)
+                if owned_item.work_type == WorkType.BATCH_TRANSCRIBE:
+                    try:
+                        audio_arrays = []
+                        for path in owned_item.payload["audio_paths"]:
+                            data, sr = sf.read(path, dtype='float32')
+                            if sr != 16000:
+                                import librosa
+
+                                data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+                            audio_arrays.append(np.array(data, dtype=np.float32))
+                        owned_item.payload["audio_tensors"] = audio_arrays
+                    except Exception as exc:
+                        log.warning(f"Prefetch failed, falling back to paths: {exc}")
+
+                while self._running:
+                    try:
+                        self._prefetch_queue.put(owned_item, timeout=0.5)
+                        owned_item = None
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            if owned_item is not None and owned_item.work_type != WorkType.SHUTDOWN:
+                owned_item.loop.call_soon_threadsafe(
+                    self._safe_set_exception, owned_item.future, RuntimeError("GPU worker shutting down")
+                )
         log.info("Prefetch thread stopped")
 
     def _drain_queues(self, queues) -> None:
@@ -491,7 +527,7 @@ class GPUWorker:
                     item = q.get_nowait()
                     if item.work_type != WorkType.SHUTDOWN:
                         item.loop.call_soon_threadsafe(
-                            item.future.set_exception, RuntimeError("GPU worker shutting down")
+                            self._safe_set_exception, item.future, RuntimeError("GPU worker shutting down")
                         )
                 except queue.Empty:
                     break
@@ -959,3 +995,7 @@ class GPUWorker:
             "final_text": final_text,
             "status": "closed",
         }
+
+
+class AudioDurationExceededError(RuntimeError):
+    pass

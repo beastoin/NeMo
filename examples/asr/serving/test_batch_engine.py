@@ -446,7 +446,7 @@ class TestConcurrentFlush(unittest.TestCase):
 
     def test_semaphore_before_dequeue(self):
         """Requests stay in _pending until a semaphore slot is available."""
-        gpu, engine = self._make_engine_with_mock(max_inflight=1, batch_wait=999)
+        gpu, engine = self._make_engine_with_mock(max_inflight=1, batch_wait=0.05)
         engine._max_batch_size = 1
 
         gate = asyncio.Event()
@@ -532,6 +532,112 @@ class TestFlushGuard(unittest.TestCase):
                     self.assertLessEqual(pending_before, 2, "Should not accumulate unbounded flush tasks")
                     gate.set()
                     return await asyncio.gather(*tasks, return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 8)
+
+
+class TestNoBatchCollapseRegression(unittest.TestCase):
+    """Regression: flush guard must not cause batch=1 collapse (PR #8666 / #13)."""
+
+    def test_no_batch1_collapse_during_gpu_processing(self):
+        """While GPU processes a batch, new requests must accumulate — not flush as batch=1."""
+        gpu = _make_mock_gpu_worker()
+        gpu._pool_size = 1
+        engine = BatchEngine(gpu, max_batch_size=4, max_wait_seconds=0.01, vram_safety_factor=0.0, max_inflight=2)
+
+        gate = asyncio.Event()
+        gpu_payloads = []
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            gpu_payloads.append(work)
+
+            async def wait_and_resolve():
+                await gate.wait()
+                if not future.done():
+                    future.set_result([{"text": "ok"} for _ in range(work["batch_size"])])
+
+            asyncio.ensure_future(wait_and_resolve())
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(4)]
+                    await asyncio.sleep(0.05)
+                    self.assertEqual(len(gpu_payloads), 1, "First batch should be on GPU")
+                    self.assertEqual(gpu_payloads[0]["batch_size"], 4, "First batch should contain all 4 requests")
+
+                    late_tasks = [asyncio.create_task(engine.submit(f"/tmp/b{i}.wav")) for i in range(3)]
+                    await asyncio.sleep(0.05)
+
+                    batch1_count = sum(1 for p in gpu_payloads if p["batch_size"] == 1)
+                    self.assertEqual(batch1_count, 0, "No batch=1 payloads should exist while GPU is busy")
+
+                    gate.set()
+                    return await asyncio.gather(*(tasks + late_tasks), return_exceptions=True)
+
+            results = loop.run_until_complete(run())
+        finally:
+            loop.run_until_complete(engine.stop())
+            loop.close()
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(successes), 7)
+
+    def test_full_batch_uses_second_inflight_slot(self):
+        """A full batch should dispatch on the second inflight slot while first is busy."""
+        gpu = _make_mock_gpu_worker()
+        gpu._pool_size = 1
+        engine = BatchEngine(gpu, max_batch_size=4, max_wait_seconds=0.01, vram_safety_factor=0.0, max_inflight=2)
+
+        gate = asyncio.Event()
+        gpu_payloads = []
+
+        def mock_submit(work_type, work, loop):
+            future = loop.create_future()
+            gpu_payloads.append(work)
+
+            async def wait_and_resolve():
+                await gate.wait()
+                if not future.done():
+                    future.set_result([{"text": "ok"} for _ in range(work["batch_size"])])
+
+            asyncio.ensure_future(wait_and_resolve())
+            return future
+
+        gpu.submit = mock_submit
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(engine.start())
+
+            async def run():
+                from unittest.mock import patch
+
+                with patch.object(BatchEngine, '_get_audio_duration', return_value=5.0):
+                    tasks = [asyncio.create_task(engine.submit(f"/tmp/a{i}.wav")) for i in range(4)]
+                    await asyncio.sleep(0.05)
+                    self.assertEqual(len(gpu_payloads), 1, "First batch on GPU")
+
+                    tasks2 = [asyncio.create_task(engine.submit(f"/tmp/b{i}.wav")) for i in range(4)]
+                    await asyncio.sleep(0.05)
+                    self.assertEqual(len(gpu_payloads), 2, "Second full batch should use second inflight slot")
+                    self.assertEqual(gpu_payloads[1]["batch_size"], 4, "Second batch should be full")
+
+                    gate.set()
+                    return await asyncio.gather(*(tasks + tasks2), return_exceptions=True)
 
             results = loop.run_until_complete(run())
         finally:

@@ -82,6 +82,7 @@ class BatchEngine:
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
         self._flush_pending = False
+        self._batches_inflight = 0
         self._inflight_sem: Optional[asyncio.Semaphore] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutting_down = False
@@ -230,11 +231,12 @@ class BatchEngine:
         Batches are dispatched as fire-and-forget tasks capped by _inflight_sem
         so the next batch can form while the GPU processes the current one.
         Only one flush task is scheduled at a time to prevent unbounded task
-        accumulation behind a saturated semaphore.
+        accumulation behind a saturated semaphore. Partial batches only flush
+        when no GPU work is inflight to prevent batch=1 throughput collapse.
         """
         while not self._shutting_down:
             await asyncio.sleep(self._max_wait_seconds)
-            if self._pending and not self._flush_pending:
+            if self._pending and not self._flush_pending and self._batches_inflight == 0:
                 self._flush_pending = True
                 asyncio.create_task(self._guarded_flush())
 
@@ -290,6 +292,7 @@ class BatchEngine:
 
     async def _flush_batch(self) -> None:
         await self._inflight_sem.acquire()
+        self._batches_inflight += 1
         try:
             async with self._lock:
                 if not self._pending:
@@ -299,7 +302,6 @@ class BatchEngine:
                 taken = set(id(r) for r in batch)
                 self._pending = [r for r in self._pending if id(r) not in taken]
 
-            # Allow new flush to be scheduled now that we've dequeued
             self._flush_pending = False
 
             if not batch:
@@ -322,6 +324,7 @@ class BatchEngine:
 
             await self._run_sub_batch(batch, any_ts)
         finally:
+            self._batches_inflight -= 1
             self._inflight_sem.release()
 
     @staticmethod
