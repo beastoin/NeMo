@@ -138,6 +138,10 @@ class GPUWorker:
         dummy_loop.close()
 
     def submit(self, work_type: WorkType, payload: Any, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
+        if not self._running:
+            fut = loop.create_future()
+            fut.set_exception(RuntimeError("GPU worker shutting down"))
+            return fut
         if not self.is_ready:
             fut = loop.create_future()
             fut.set_exception(RuntimeError("GPU worker not ready"))
@@ -161,6 +165,8 @@ class GPUWorker:
         log.info("GPU worker thread started")
         try:
             self._load_models()
+            if self._pool_size > 1:
+                self._start_pool_workers()
             self._ready.set()
         except Exception as exc:
             log.error(f"Model loading failed: {exc}")
@@ -364,8 +370,8 @@ class GPUWorker:
                 }
             item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
 
-    def _run_pool_mode(self) -> None:
-        log.info(f"Running in pool mode: {self._pool_size} model workers")
+    def _start_pool_workers(self) -> None:
+        log.info(f"Starting pool mode: {self._pool_size} model workers")
         for i in range(self._pool_size):
             q = queue.Queue(maxsize=_MAX_GPU_QUEUE)
             self._pool_queues.append(q)
@@ -378,7 +384,7 @@ class GPUWorker:
             self._pool_threads.append(t)
             t.start()
 
-        # Main thread handles streaming only (if any)
+    def _run_pool_mode(self) -> None:
         while self._running:
             try:
                 item = self._stream_queue.get(timeout=0.1)
@@ -402,9 +408,12 @@ class GPUWorker:
         for t in self._pool_threads:
             t.join(timeout=30)
 
+        self._drain_queues(self._pool_queues + [self._stream_queue, self._batch_queue])
+
     @torch.inference_mode()
     def _pool_worker_loop(self, idx: int, model, q: queue.Queue) -> None:
         stream = torch.cuda.Stream()
+        gc_counter = 0
         log.info(f"Pool worker {idx} started (stream={stream})")
         while self._running:
             try:
@@ -420,7 +429,11 @@ class GPUWorker:
             except Exception as exc:
                 item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
             finally:
-                self._maybe_gc()
+                gc.collect(0)
+                gc_counter += 1
+                if gc_counter >= self._gc_interval:
+                    gc.collect()
+                    gc_counter = 0
         log.info(f"Pool worker {idx} stopped")
 
     def _run_prefetch_mode(self) -> None:
@@ -450,7 +463,13 @@ class GPUWorker:
             finally:
                 self._maybe_gc()
 
-        self._drain_queues([self._stream_queue, self._batch_queue])
+        drain_list = [self._stream_queue, self._batch_queue]
+        if self._prefetch_queue is not None:
+            drain_list.append(self._prefetch_queue)
+        self._drain_queues(drain_list)
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=10)
+            self._drain_queues([self._prefetch_queue])
 
     def _prefetch_loop(self) -> None:
         import numpy as np
@@ -481,7 +500,12 @@ class GPUWorker:
                 except Exception as exc:
                     log.warning(f"Prefetch failed, falling back to paths: {exc}")
 
-            self._prefetch_queue.put(item)
+            while self._running:
+                try:
+                    self._prefetch_queue.put(item, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
         log.info("Prefetch thread stopped")
 
     def _drain_queues(self, queues) -> None:
@@ -491,7 +515,7 @@ class GPUWorker:
                     item = q.get_nowait()
                     if item.work_type != WorkType.SHUTDOWN:
                         item.loop.call_soon_threadsafe(
-                            item.future.set_exception, RuntimeError("GPU worker shutting down")
+                            self._safe_set_exception, item.future, RuntimeError("GPU worker shutting down")
                         )
                 except queue.Empty:
                     break
