@@ -161,10 +161,24 @@ def _basic_wer(references, hypotheses):
     return total_errors / max(total_words, 1), per_utt
 
 
+def get_wav_duration(wav_path):
+    """Get audio duration in seconds from WAV file header."""
+    with open(wav_path, "rb") as f:
+        f.read(24)  # skip to byte rate offset
+        import struct
+
+        f.seek(28)
+        byte_rate = struct.unpack("<I", f.read(4))[0]
+        f.seek(40)
+        data_size = struct.unpack("<I", f.read(4))[0]
+        return data_size / byte_rate if byte_rate > 0 else 0
+
+
 async def transcribe_file(session, url, wav_path, semaphore):
     """Send one file to /v1/transcribe, return result dict."""
     async with semaphore:
         t0 = time.monotonic()
+        audio_dur = get_wav_duration(wav_path)
         try:
             data = aiohttp.FormData()
             data.add_field(
@@ -181,6 +195,7 @@ async def transcribe_file(session, url, wav_path, semaphore):
                         "utt_id": Path(wav_path).stem,
                         "text": result.get("text", ""),
                         "elapsed": elapsed,
+                        "audio_dur": audio_dur,
                         "status": "ok",
                     }
                 else:
@@ -213,10 +228,11 @@ async def run_sweep(url, wav_files, concurrency, repeat=1):
 
 
 def summarize_sweep(results, wall_time, concurrency):
-    """Compute throughput/latency summary for one concurrency level."""
+    """Compute throughput/latency/RTFx summary for one concurrency level."""
     ok = [r for r in results if r["status"] == "ok"]
     failed = [r for r in results if r["status"] == "error"]
     latencies = sorted(r["elapsed"] for r in ok)
+    total_audio = sum(r.get("audio_dur", 0) for r in ok)
 
     summary = {
         "concurrency": concurrency,
@@ -225,6 +241,10 @@ def summarize_sweep(results, wall_time, concurrency):
         "failures": len(failed),
         "wall_s": round(wall_time, 2),
         "rps": round(len(ok) / wall_time, 2) if wall_time > 0 else 0,
+        "rtfx": round(total_audio / wall_time, 2) if wall_time > 0 else 0,
+        "rtf": round(wall_time / total_audio, 4) if total_audio > 0 else 0,
+        "total_audio_s": round(total_audio, 1),
+        "sess_per_min": round(len(ok) / (wall_time / 60), 1) if wall_time > 0 else 0,
     }
     if latencies:
         summary["p50_s"] = round(latencies[len(latencies) // 2], 3)
@@ -314,7 +334,7 @@ async def main():
         results, wall = await run_sweep(url, wav_files, concurrency=c)
         summary = summarize_sweep(results, wall, c)
         sweep_results.append(summary)
-        log.info(f"    {summary['rps']} RPS, p50={summary.get('p50_s', '?')}s, failures={summary['failures']}")
+        log.info(f"    {summary['rps']} RPS, RTFx={summary['rtfx']}x, p50={summary.get('p50_s', '?')}s, failures={summary['failures']}")
 
     report["concurrency_sweep"] = sweep_results
 
@@ -337,10 +357,18 @@ async def main():
 
     # Step 6: Summary
     peak = max(sweep_results, key=lambda x: x["rps"])
+    max_conc_zero_fail = max(
+        (s for s in sweep_results if s["failures"] == 0),
+        key=lambda x: x["concurrency"],
+        default=peak,
+    )
     report["summary"] = {
         "peak_rps": peak["rps"],
+        "peak_rtfx": peak["rtfx"],
         "peak_concurrency": peak["concurrency"],
+        "max_concurrency_zero_fail": max_conc_zero_fail["concurrency"],
         "sustained_rps": sustained_summary["rps"],
+        "sustained_rtfx": sustained_summary["rtfx"],
         "total_failures": sum(s["failures"] for s in sweep_results) + sustained_summary["failures"],
         "wer_pct": report.get("wer", {}).get("corpus_wer_pct"),
     }
@@ -355,10 +383,14 @@ async def main():
               f"{report['wer']['normalization']} normalization)")
         print()
     print("### Concurrency Sweep")
-    print("| c | RPS | p50 | p99 | Failures |")
-    print("|---|-----|-----|-----|----------|")
+    print("| c | RPS | RTFx | RTF | sess/min | p50 | p99 | Failures |")
+    print("|---|-----|------|-----|----------|-----|-----|----------|")
     for s in sweep_results:
-        print(f"| {s['concurrency']} | {s['rps']} | {s.get('p50_s', '?')}s | {s.get('p99_s', '?')}s | {s['failures']} |")
+        print(f"| {s['concurrency']} | {s['rps']} | {s['rtfx']}x | {s['rtf']} "
+              f"| {s['sess_per_min']} | {s.get('p50_s', '?')}s | {s.get('p99_s', '?')}s | {s['failures']} |")
+    print()
+    print(f"**Peak:** {peak['rps']} RPS / {peak['rtfx']}x RTFx at c={peak['concurrency']} "
+          f"| **Max concurrency (0 failures):** c={max_conc_zero_fail['concurrency']}")
     print()
     print("### Sustained Load")
     print(f"| Metric | Value |")
@@ -366,6 +398,8 @@ async def main():
     print(f"| Concurrency | {sustained_summary['concurrency']} |")
     print(f"| Total files | {sustained_summary['total_files']} |")
     print(f"| RPS | {sustained_summary['rps']} |")
+    print(f"| RTFx | {sustained_summary['rtfx']}x |")
+    print(f"| sess/min | {sustained_summary['sess_per_min']} |")
     print(f"| p50 / p99 | {sustained_summary.get('p50_s', '?')}s / {sustained_summary.get('p99_s', '?')}s |")
     print(f"| Failures | {sustained_summary['failures']} |")
 
