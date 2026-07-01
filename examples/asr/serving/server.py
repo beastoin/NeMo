@@ -147,18 +147,29 @@ def _patch_ws_upgrade():
 
     def _safe_handle_websocket_upgrade(self):
         method = self.scope["method"].encode()
-        sp = bytes([0x20])
-        output = [method, sp, self.url, sp, b"HTTP/1.1\r\n"]
+        url = self.url
+        request_line = bytearray()
+        request_line.extend(method)
+        request_line.append(0x20)
+        request_line.extend(url)
+        request_line.append(0x20)
+        request_line.extend(b"HTTP/1.1\r\n")
         for name, value in self.scope["headers"]:
-            output += [name, b": ", value, b"\r\n"]
-        output.append(b"\r\n")
+            request_line.extend(name)
+            request_line.append(0x3A)
+            request_line.append(0x20)
+            request_line.extend(value)
+            request_line.append(0x0D)
+            request_line.append(0x0A)
+        request_line.append(0x0D)
+        request_line.append(0x0A)
         protocol = self.ws_protocol_class(
             config=self.config,
             server_state=self.server_state,
             app_state=self.app_state,
         )
         protocol.connection_made(self.transport)
-        protocol.data_received(b"".join(output))
+        protocol.data_received(bytes(request_line))
         self.transport.set_protocol(protocol)
         self.connections.discard(self)
 
