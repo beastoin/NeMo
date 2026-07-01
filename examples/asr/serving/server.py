@@ -48,7 +48,7 @@ from typing import Optional
 # can trigger on the async event-loop thread and free CUDA pinned-memory
 # tensors there, crashing in CachingHostAllocatorImpl::free().  The GPU
 # worker calls gc.collect() after every batch on its own thread instead.
-# gc.disable()  # temporarily disabled for WebSocket debugging
+gc.disable()
 
 import uvicorn
 import yaml
@@ -133,68 +133,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
-def _patch_protocol_debug():
-    """Monkey-patch uvicorn's HTTP protocol to trace WebSocket upgrade."""
-    import uvicorn.protocols.http.httptools_impl as _hi
-
-    _orig_data_received = _hi.HttpToolsProtocol.data_received
-    _orig_handle_ws = _hi.HttpToolsProtocol.handle_websocket_upgrade
-    _orig_send_400 = _hi.HttpToolsProtocol.send_400_response
-    _orig_on_headers_complete = _hi.HttpToolsProtocol.on_headers_complete
-
-    def _debug_on_headers_complete(self):
-        method_raw = self.parser.get_method()
-        log.info(
-            f"[WS_DEBUG] on_headers_complete: method_raw={method_raw!r} "
-            f"should_upgrade={self.parser.should_upgrade()} "
-            f"id(self)={id(self):#x} id(parser)={id(self.parser):#x}"
-        )
-        return _orig_on_headers_complete(self)
-
-    def _debug_data_received(self, data):
-        if b"Upgrade: websocket" in data or b"upgrade: websocket" in data:
-            log.info(
-                f"[WS_DEBUG] data_received WS upgrade ({len(data)} bytes) "
-                f"id(self)={id(self):#x}"
-            )
-        elif b"POST" in data[:10] or b"GET" in data[:10]:
-            log.info(
-                f"[WS_DEBUG] data_received {data[:4]!r} ({len(data)} bytes) "
-                f"id(self)={id(self):#x}"
-            )
-        return _orig_data_received(self, data)
-
-    def _debug_handle_ws(self):
-        method = self.scope.get("method", "")
-        method_bytes = method.encode()
-        log.info(
-            f"[WS_DEBUG] handle_websocket_upgrade: "
-            f"method={method!r} method_hex={method_bytes.hex()} "
-            f"url={self.url!r} url_hex={self.url.hex()} "
-            f"id(self)={id(self):#x}"
-        )
-        output = [method_bytes, b" ", self.url, b" HTTP/1.1\r\n"]
-        for name, value in self.scope.get("headers", []):
-            output += [name, b": ", value, b"\r\n"]
-        output.append(b"\r\n")
-        raw = b"".join(output)
-        log.info(f"[WS_DEBUG] raw first line hex: {raw[:40].hex()}")
-        return _orig_handle_ws(self)
-
-    def _debug_send_400(self, msg):
-        log.info(f"[WS_DEBUG] send_400_response: {msg}")
-        import traceback
-        log.info("".join(traceback.format_stack()))
-        return _orig_send_400(self, msg)
-
-    _hi.HttpToolsProtocol.on_headers_complete = _debug_on_headers_complete
-    _hi.HttpToolsProtocol.data_received = _debug_data_received
-    _hi.HttpToolsProtocol.handle_websocket_upgrade = _debug_handle_ws
-    _hi.HttpToolsProtocol.send_400_response = _debug_send_400
-
-
-_patch_protocol_debug()
 
 
 # --- Health & Metrics ---
@@ -464,7 +402,7 @@ def main():
         host=host,
         port=port,
         workers=server_cfg.get("workers", 1),
-        ws="websockets",
+        ws="auto",
         log_level="info",
     )
 
