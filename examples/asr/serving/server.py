@@ -134,6 +134,39 @@ app = FastAPI(
 )
 
 
+def _patch_ws_upgrade():
+    """Work around CUDA CachingHostAllocator corrupting interned byte constants.
+
+    GPU inference can corrupt Python's interned b" " (0x20 -> 0x00), breaking
+    WebSocket upgrade requests. We replace the affected method to use freshly
+    allocated bytes objects instead of interned constants.
+    """
+    import uvicorn.protocols.http.httptools_impl as _hi
+
+    _orig = _hi.HttpToolsProtocol.handle_websocket_upgrade
+
+    def _safe_handle_websocket_upgrade(self):
+        method = self.scope["method"].encode()
+        sp = bytes([0x20])
+        output = [method, sp, self.url, sp, b"HTTP/1.1\r\n"]
+        for name, value in self.scope["headers"]:
+            output += [name, b": ", value, b"\r\n"]
+        output.append(b"\r\n")
+        protocol = self.ws_protocol_class(
+            config=self.config,
+            server_state=self.server_state,
+            app_state=self.app_state,
+        )
+        protocol.connection_made(self.transport)
+        protocol.data_received(b"".join(output))
+        self.transport.set_protocol(protocol)
+        self.connections.discard(self)
+
+    _hi.HttpToolsProtocol.handle_websocket_upgrade = _safe_handle_websocket_upgrade
+
+
+_patch_ws_upgrade()
+
 
 # --- Health & Metrics ---
 
