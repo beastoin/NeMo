@@ -73,11 +73,8 @@ async def run_stream(ws_url, wav_files, concurrency, chunk_ms):
     return list(results), wall
 
 
-async def run_combined(batch_url, ws_url, wav_files, batch_c, stream_c, chunk_ms):
+async def run_combined(batch_url, ws_url, batch_files, stream_files, batch_c, stream_c, chunk_ms):
     """Run batch and streaming concurrently, return (batch_results, stream_results, wall_time)."""
-    half = len(wav_files) // 2
-    batch_files = wav_files[:half]
-    stream_files = wav_files[half:]
 
     t0 = time.monotonic()
     batch_task = asyncio.create_task(run_batch(batch_url, batch_files, batch_c))
@@ -111,6 +108,7 @@ async def main():
     parser.add_argument("--sustained-stream-c", type=int, default=8, help="Sustained stream concurrency")
     parser.add_argument("--skip-baselines", action="store_true", help="Skip isolated baseline runs")
     parser.add_argument("--skip-wer", action="store_true", help="Skip WER computation")
+    parser.add_argument("--n-stream-files", type=int, default=50, help="Max WAV files for streaming tests")
     parser.add_argument("--output", default="/tmp/bench_combined_report.json", help="Output JSON path")
     args = parser.parse_args()
 
@@ -129,7 +127,8 @@ async def main():
     refs = load_references()
     wav_dir = Path("/tmp/librispeech-test-clean/wav")
     wav_files = sorted(wav_dir.glob("*.wav"))[:200]
-    log.info(f"Using {len(wav_files)} WAV files")
+    stream_wav_files = wav_files[: args.n_stream_files]
+    log.info(f"Using {len(wav_files)} WAV files (batch), {len(stream_wav_files)} (stream)")
 
     report = {
         "benchmark": "NeMo ASR Combined Benchmark",
@@ -160,7 +159,7 @@ async def main():
 
         for c in stream_levels:
             log.info(f"  Stream-only c={c}...")
-            results, wall = await run_stream(ws_url, wav_files, c, args.chunk_ms)
+            results, wall = await run_stream(ws_url, stream_wav_files, c, args.chunk_ms)
             baselines["stream"][c] = summarize_stream(results, wall, c)
             s = baselines["stream"][c]
             log.info(f"    RTFx={s['rtfx']}, sess/min={s['sess_per_min']}, failures={s['failures']}")
@@ -178,7 +177,7 @@ async def main():
     for bc in batch_levels:
         for sc in stream_levels:
             log.info(f"  Combined: batch c={bc} + stream c={sc}...")
-            batch_res, stream_res, wall = await run_combined(batch_url, ws_url, wav_files, bc, sc, args.chunk_ms)
+            batch_res, stream_res, wall = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms)
             batch_summary = summarize_batch(batch_res, wall, bc)
             stream_summary = summarize_stream(stream_res, wall, sc)
 
@@ -223,7 +222,7 @@ async def main():
     all_stream_results = []
     t0 = time.monotonic()
     for r in range(rounds):
-        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, bc, sc, args.chunk_ms)
+        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms)
         all_batch_results.extend(batch_res)
         all_stream_results.extend(stream_res)
         elapsed = time.monotonic() - t0
@@ -255,7 +254,7 @@ async def main():
     # ── Phase 4: WER (combined mode, c=1+1) ──
     if not args.skip_wer:
         log.info("Phase 4: WER evaluation (combined c=1+1)...")
-        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, 1, 1, args.chunk_ms)
+        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, 1, 1, args.chunk_ms)
 
         wer_data = {}
         for label, results in [("batch", batch_res), ("stream", stream_res)]:
