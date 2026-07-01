@@ -167,11 +167,19 @@ def _patch_protocol_debug():
 
     def _debug_handle_ws(self):
         method = self.scope.get("method", "")
+        method_bytes = method.encode()
         log.info(
             f"[WS_DEBUG] handle_websocket_upgrade: "
-            f"method={method!r} url={self.url!r} "
+            f"method={method!r} method_hex={method_bytes.hex()} "
+            f"url={self.url!r} url_hex={self.url.hex()} "
             f"id(self)={id(self):#x}"
         )
+        output = [method_bytes, b" ", self.url, b" HTTP/1.1\r\n"]
+        for name, value in self.scope.get("headers", []):
+            output += [name, b": ", value, b"\r\n"]
+        output.append(b"\r\n")
+        raw = b"".join(output)
+        log.info(f"[WS_DEBUG] raw first line hex: {raw[:40].hex()}")
         return _orig_handle_ws(self)
 
     def _debug_send_400(self, msg):
