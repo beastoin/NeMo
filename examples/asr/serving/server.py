@@ -134,6 +134,47 @@ app = FastAPI(
 )
 
 
+def _patch_protocol_debug():
+    """Monkey-patch uvicorn's HTTP protocol to trace WebSocket upgrade."""
+    import uvicorn.protocols.http.httptools_impl as _hi
+
+    _orig_data_received = _hi.HttpToolsProtocol.data_received
+    _orig_handle_ws = _hi.HttpToolsProtocol.handle_websocket_upgrade
+    _orig_send_400 = _hi.HttpToolsProtocol.send_400_response
+
+    def _debug_data_received(self, data):
+        if b"Upgrade: websocket" in data or b"upgrade: websocket" in data:
+            log.info(f"[WS_DEBUG] HTTP data_received with WS upgrade ({len(data)} bytes)")
+        return _orig_data_received(self, data)
+
+    def _debug_handle_ws(self):
+        log.info(
+            f"[WS_DEBUG] handle_websocket_upgrade: url={self.url} "
+            f"method={self.scope.get('method')} "
+            f"headers_count={len(self.scope.get('headers', []))}"
+        )
+        output_data = [self.scope["method"].encode(), b" ", self.url, b" HTTP/1.1\r\n"]
+        for name, value in self.scope.get("headers", []):
+            output_data += [name, b": ", value, b"\r\n"]
+        output_data.append(b"\r\n")
+        reconstructed = b"".join(output_data)
+        log.info(f"[WS_DEBUG] reconstructed request ({len(reconstructed)} bytes): {reconstructed[:200]}")
+        return _orig_handle_ws(self)
+
+    def _debug_send_400(self, msg):
+        log.info(f"[WS_DEBUG] send_400_response: {msg}")
+        import traceback
+        traceback.print_stack()
+        return _orig_send_400(self, msg)
+
+    _hi.HttpToolsProtocol.data_received = _debug_data_received
+    _hi.HttpToolsProtocol.handle_websocket_upgrade = _debug_handle_ws
+    _hi.HttpToolsProtocol.send_400_response = _debug_send_400
+
+
+_patch_protocol_debug()
+
+
 # --- Health & Metrics ---
 
 
