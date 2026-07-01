@@ -401,7 +401,7 @@ def main():
         host=host,
         port=port,
         workers=server_cfg.get("workers", 1),
-        ws="wsproto",
+        ws="websockets",
         log_level="info",
     )
 
