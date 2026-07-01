@@ -401,6 +401,7 @@ def main():
         host=host,
         port=port,
         workers=server_cfg.get("workers", 1),
+        ws="wsproto",
         log_level="info",
     )
 
