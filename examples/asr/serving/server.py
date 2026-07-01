@@ -48,7 +48,7 @@ from typing import Optional
 # can trigger on the async event-loop thread and free CUDA pinned-memory
 # tensors there, crashing in CachingHostAllocatorImpl::free().  The GPU
 # worker calls gc.collect() after every batch on its own thread instead.
-gc.disable()
+# gc.disable()  # temporarily disabled for WebSocket debugging
 
 import uvicorn
 import yaml
