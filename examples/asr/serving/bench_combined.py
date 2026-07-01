@@ -11,6 +11,7 @@ Phases:
   1. Isolated baselines  — batch-only and stream-only (for comparison)
   2. Combined load       — batch and streaming concurrently at several mix ratios
   3. Sustained combined  — extended combined run to check stability
+  5. Duration stress     — test with long audio files (30s–300s) to find OOM threshold
 
 Usage:
     python3 bench_combined.py --server http://localhost:8000
@@ -23,6 +24,8 @@ import asyncio
 import json
 import logging
 import os
+import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,6 +51,54 @@ from bench_stream import (
 from bench_stream import summarize_sweep as summarize_stream
 
 SR = 16000
+
+
+def get_vram_mb():
+    """Get current GPU VRAM usage in MB via nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            timeout=5,
+        )
+        used, total = out.decode().strip().split(", ")
+        return int(used), int(total)
+    except Exception:
+        return None, None
+
+
+def create_long_wav(source_files, target_duration_s, output_path):
+    """Create a WAV file of approximately target_duration_s by concatenating source files."""
+    import soundfile as sf
+
+    chunks = []
+    total_samples = 0
+    target_samples = int(target_duration_s * SR)
+
+    while total_samples < target_samples:
+        for src in source_files:
+            audio, sr = sf.read(str(src), dtype="int16")
+            if sr != SR:
+                continue
+            chunks.append(audio)
+            total_samples += len(audio)
+            if total_samples >= target_samples:
+                break
+
+    import numpy as np
+
+    combined = np.concatenate(chunks)[:target_samples]
+    data_size = len(combined) * 2
+    with open(output_path, "wb") as wf:
+        wf.write(b"RIFF")
+        wf.write(struct.pack("<I", 36 + data_size))
+        wf.write(b"WAVE")
+        wf.write(b"fmt ")
+        wf.write(struct.pack("<IHHIIHH", 16, 1, 1, SR, SR * 2, 2, 16))
+        wf.write(b"data")
+        wf.write(struct.pack("<I", data_size))
+        wf.write(combined.tobytes())
+
+    return get_wav_duration(output_path)
 
 
 async def run_batch(url, wav_files, concurrency):
@@ -109,6 +160,11 @@ async def main():
     parser.add_argument("--skip-baselines", action="store_true", help="Skip isolated baseline runs")
     parser.add_argument("--skip-wer", action="store_true", help="Skip WER computation")
     parser.add_argument("--n-stream-files", type=int, default=50, help="Max WAV files for streaming tests")
+    parser.add_argument("--duration-sweep", action="store_true", default=False, help="Run duration stress test")
+    parser.add_argument(
+        "--duration-targets", default="30,60,120,300", help="Target durations in seconds for stress test"
+    )
+    parser.add_argument("--duration-batch-c", default="1,4,8", help="Batch concurrency levels for duration sweep")
     parser.add_argument("--output", default="/tmp/bench_combined_report.json", help="Output JSON path")
     args = parser.parse_args()
 
@@ -130,6 +186,17 @@ async def main():
     stream_wav_files = wav_files[: args.n_stream_files]
     log.info(f"Using {len(wav_files)} WAV files (batch), {len(stream_wav_files)} (stream)")
 
+    # Build duration map for existing files
+    file_durations = {}
+    for f in wav_files:
+        file_durations[str(f)] = get_wav_duration(f)
+
+    dur_stats = sorted(file_durations.values())
+    log.info(
+        f"File durations: min={dur_stats[0]:.1f}s, max={dur_stats[-1]:.1f}s, "
+        f"mean={sum(dur_stats)/len(dur_stats):.1f}s, median={dur_stats[len(dur_stats)//2]:.1f}s"
+    )
+
     report = {
         "benchmark": "NeMo ASR Combined Benchmark",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -137,6 +204,19 @@ async def main():
         "chunk_ms": args.chunk_ms,
         "samples": len(wav_files),
         "dataset": "LibriSpeech test-clean",
+        "file_duration_stats": {
+            "min_s": round(dur_stats[0], 1),
+            "max_s": round(dur_stats[-1], 1),
+            "mean_s": round(sum(dur_stats) / len(dur_stats), 1),
+            "median_s": round(dur_stats[len(dur_stats) // 2], 1),
+            "buckets": {
+                "0-5s": sum(1 for d in dur_stats if d <= 5),
+                "5-10s": sum(1 for d in dur_stats if 5 < d <= 10),
+                "10-15s": sum(1 for d in dur_stats if 10 < d <= 15),
+                "15-20s": sum(1 for d in dur_stats if 15 < d <= 20),
+                "20s+": sum(1 for d in dur_stats if d > 20),
+            },
+        },
     }
 
     # ── Warmup ──
@@ -177,7 +257,9 @@ async def main():
     for bc in batch_levels:
         for sc in stream_levels:
             log.info(f"  Combined: batch c={bc} + stream c={sc}...")
-            batch_res, stream_res, wall = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms)
+            batch_res, stream_res, wall = await run_combined(
+                batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms
+            )
             batch_summary = summarize_batch(batch_res, wall, bc)
             stream_summary = summarize_stream(stream_res, wall, sc)
 
@@ -222,7 +304,9 @@ async def main():
     all_stream_results = []
     t0 = time.monotonic()
     for r in range(rounds):
-        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms)
+        batch_res, stream_res, _ = await run_combined(
+            batch_url, ws_url, wav_files, stream_wav_files, bc, sc, args.chunk_ms
+        )
         all_batch_results.extend(batch_res)
         all_stream_results.extend(stream_res)
         elapsed = time.monotonic() - t0
@@ -254,7 +338,9 @@ async def main():
     # ── Phase 4: WER (combined mode, c=1+1) ──
     if not args.skip_wer:
         log.info("Phase 4: WER evaluation (combined c=1+1)...")
-        batch_res, stream_res, _ = await run_combined(batch_url, ws_url, wav_files, stream_wav_files, 1, 1, args.chunk_ms)
+        batch_res, stream_res, _ = await run_combined(
+            batch_url, ws_url, wav_files, stream_wav_files, 1, 1, args.chunk_ms
+        )
 
         wer_data = {}
         for label, results in [("batch", batch_res), ("stream", stream_res)]:
@@ -274,6 +360,125 @@ async def main():
                 log.info(f"  {label} WER: {wer_val*100:.2f}% ({len(ref_texts)} samples)")
 
         report["wer"] = wer_data
+
+    # ── Phase 5: Duration stress test ──
+    if args.duration_sweep:
+        duration_targets = [int(x) for x in args.duration_targets.split(",")]
+        duration_batch_levels = [int(x) for x in args.duration_batch_c.split(",")]
+        log.info(f"Phase 5: Duration stress test — {duration_targets}s files, batch c={duration_batch_levels}")
+
+        long_dir = Path("/tmp/bench-long-wavs")
+        long_dir.mkdir(exist_ok=True)
+
+        source_files = sorted(wav_dir.glob("*.wav"))
+        long_files = {}
+        for dur in duration_targets:
+            out_path = long_dir / f"synthetic_{dur}s.wav"
+            if not out_path.exists():
+                actual = create_long_wav(source_files, dur, out_path)
+                log.info(f"  Created {dur}s synthetic file ({actual:.1f}s actual)")
+            else:
+                actual = get_wav_duration(out_path)
+                log.info(f"  Reusing {dur}s synthetic file ({actual:.1f}s actual)")
+            long_files[dur] = out_path
+
+        n_copies = 4
+        duration_results = []
+
+        for dur in duration_targets:
+            copies = [long_files[dur]] * n_copies
+            dur_entry = {"target_duration_s": dur, "actual_duration_s": round(get_wav_duration(long_files[dur]), 1)}
+
+            vram_before, vram_total = get_vram_mb()
+            dur_entry["vram_before_mb"] = vram_before
+            dur_entry["vram_total_mb"] = vram_total
+
+            # Batch-only with long files
+            batch_results_by_c = []
+            for bc in duration_batch_levels:
+                log.info(f"  Duration {dur}s — batch-only c={bc} ({n_copies} files)...")
+                try:
+                    results, wall = await asyncio.wait_for(
+                        run_batch(batch_url, copies, bc), timeout=max(dur * n_copies * 2, 120)
+                    )
+                    summary = summarize_batch(results, wall, bc)
+                    vram_after, _ = get_vram_mb()
+                    summary["vram_after_mb"] = vram_after
+                    batch_results_by_c.append(summary)
+                    log.info(
+                        f"    RPS={summary['rps']}, RTFx={summary['rtfx']}, "
+                        f"fail={summary['failures']}, VRAM={vram_after}MB"
+                    )
+                except (asyncio.TimeoutError, Exception) as e:
+                    vram_after, _ = get_vram_mb()
+                    error_entry = {
+                        "concurrency": bc,
+                        "total": n_copies,
+                        "ok": 0,
+                        "failures": n_copies,
+                        "error": str(e)[:200],
+                        "vram_after_mb": vram_after,
+                    }
+                    batch_results_by_c.append(error_entry)
+                    log.info(f"    FAILED: {str(e)[:100]}, VRAM={vram_after}MB")
+
+            dur_entry["batch_only"] = batch_results_by_c
+
+            # Combined: long batch files + streaming
+            combined_by_c = []
+            for bc in duration_batch_levels:
+                sc = stream_levels[-1]
+                log.info(f"  Duration {dur}s — combined batch c={bc} + stream c={sc}...")
+                try:
+                    batch_res, stream_res, wall = await asyncio.wait_for(
+                        run_combined(batch_url, ws_url, copies, stream_wav_files[:10], bc, sc, args.chunk_ms),
+                        timeout=max(dur * n_copies * 2, 120),
+                    )
+                    b_sum = summarize_batch(batch_res, wall, bc)
+                    s_sum = summarize_stream(stream_res, wall, sc)
+                    vram_after, _ = get_vram_mb()
+                    combo = {
+                        "batch_concurrency": bc,
+                        "stream_concurrency": sc,
+                        "batch": b_sum,
+                        "stream": s_sum,
+                        "vram_after_mb": vram_after,
+                    }
+                    combined_by_c.append(combo)
+                    log.info(
+                        f"    Batch: RPS={b_sum['rps']}, fail={b_sum['failures']} | "
+                        f"Stream: sess/min={s_sum['sess_per_min']}, fail={s_sum['failures']} | "
+                        f"VRAM={vram_after}MB"
+                    )
+                except (asyncio.TimeoutError, Exception) as e:
+                    vram_after, _ = get_vram_mb()
+                    combo = {
+                        "batch_concurrency": bc,
+                        "stream_concurrency": sc,
+                        "error": str(e)[:200],
+                        "vram_after_mb": vram_after,
+                    }
+                    combined_by_c.append(combo)
+                    log.info(f"    FAILED: {str(e)[:100]}, VRAM={vram_after}MB")
+
+            dur_entry["combined"] = combined_by_c
+            duration_results.append(dur_entry)
+
+        report["duration_stress"] = duration_results
+
+        # Find OOM threshold
+        max_ok_dur = 0
+        for dr in duration_results:
+            all_ok = all(b.get("failures", 0) == 0 for b in dr["batch_only"]) and all(
+                c.get("error") is None and c.get("batch", {}).get("failures", 0) == 0 for c in dr["combined"]
+            )
+            if all_ok:
+                max_ok_dur = dr["target_duration_s"]
+        report["duration_stress_summary"] = {
+            "max_zero_fail_duration_s": max_ok_dur,
+            "durations_tested": duration_targets,
+        }
+        log.info(f"  Duration stress: max zero-fail duration = {max_ok_dur}s")
 
     # ── Summary ──
     best_combined = max(combined_results, key=lambda x: x["batch"]["rps"] + x["stream"]["sess_per_min"])
@@ -391,6 +596,47 @@ async def main():
         f"**Sustained:** {sc['total_requests']} total requests, "
         f"{sc['total_failures']} failures in {sc['wall_min']} min"
     )
+
+    if "duration_stress" in report:
+        print()
+        print("### Duration Stress Test (long audio files)")
+        print()
+        print("**Batch-only with long files**")
+        print("| Duration | Concurrency | RPS | RTFx | Failures | VRAM (MB) | Result |")
+        print("|----------|-------------|-----|------|----------|-----------|--------|")
+        for dr in report["duration_stress"]:
+            for b in dr["batch_only"]:
+                fails = b.get("failures", b.get("total", "?"))
+                result = "PASS" if b.get("failures", 1) == 0 else "FAIL"
+                rps = b.get("rps", "-")
+                rtfx = b.get("rtfx", "-")
+                vram = b.get("vram_after_mb", "-")
+                print(
+                    f"| {dr['target_duration_s']}s | {b.get('concurrency', '?')} | "
+                    f"{rps} | {rtfx} | {fails} | {vram} | {result} |"
+                )
+        print()
+        print("**Combined (long batch + streaming)**")
+        print("| Duration | Batch c | Stream c | Batch fail | Stream fail | VRAM (MB) | Result |")
+        print("|----------|---------|----------|------------|-------------|-----------|--------|")
+        for dr in report["duration_stress"]:
+            for c in dr["combined"]:
+                if "error" in c:
+                    print(
+                        f"| {dr['target_duration_s']}s | {c['batch_concurrency']} | "
+                        f"{c['stream_concurrency']} | ERROR | ERROR | {c.get('vram_after_mb', '-')} | FAIL |"
+                    )
+                else:
+                    bf = c["batch"]["failures"]
+                    sf = c["stream"]["failures"]
+                    result = "PASS" if bf == 0 and sf == 0 else "FAIL"
+                    print(
+                        f"| {dr['target_duration_s']}s | {c['batch_concurrency']} | "
+                        f"{c['stream_concurrency']} | {bf} | {sf} | {c.get('vram_after_mb', '-')} | {result} |"
+                    )
+        ds = report.get("duration_stress_summary", {})
+        print()
+        print(f"**Max zero-fail duration:** {ds.get('max_zero_fail_duration_s', '?')}s")
 
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2)
