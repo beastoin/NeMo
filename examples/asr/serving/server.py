@@ -134,6 +134,52 @@ app = FastAPI(
 )
 
 
+def _patch_ws_upgrade():
+    """Defensive patch: use freshly allocated bytes in WebSocket upgrade requests.
+
+    GPU inference may corrupt Python byte constants used in HTTP request
+    construction. This replaces the affected method with one that builds
+    the request line from individually allocated bytes, avoiding any
+    dependency on interned single-byte constants.
+    """
+    import uvicorn.protocols.http.httptools_impl as _hi
+
+    _orig = _hi.HttpToolsProtocol.handle_websocket_upgrade
+
+    def _safe_handle_websocket_upgrade(self):
+        method = self.scope["method"].encode()
+        url = self.url
+        request_line = bytearray()
+        request_line.extend(method)
+        request_line.append(0x20)
+        request_line.extend(url)
+        request_line.append(0x20)
+        request_line.extend(b"HTTP/1.1\r\n")
+        for name, value in self.scope["headers"]:
+            request_line.extend(name)
+            request_line.append(0x3A)
+            request_line.append(0x20)
+            request_line.extend(value)
+            request_line.append(0x0D)
+            request_line.append(0x0A)
+        request_line.append(0x0D)
+        request_line.append(0x0A)
+        protocol = self.ws_protocol_class(
+            config=self.config,
+            server_state=self.server_state,
+            app_state=self.app_state,
+        )
+        protocol.connection_made(self.transport)
+        protocol.data_received(bytes(request_line))
+        self.transport.set_protocol(protocol)
+        self.connections.discard(self)
+
+    _hi.HttpToolsProtocol.handle_websocket_upgrade = _safe_handle_websocket_upgrade
+
+
+_patch_ws_upgrade()
+
+
 # --- Health & Metrics ---
 
 
@@ -401,6 +447,7 @@ def main():
         host=host,
         port=port,
         workers=server_cfg.get("workers", 1),
+        ws="auto",
         log_level="info",
     )
 
