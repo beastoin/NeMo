@@ -613,6 +613,12 @@ async def main():
         available_durations = [d for d in chaos_durations if d in chaos_files and d <= args.chaos_max_dur]
         if not available_durations:
             log.error(f"  No chaos durations available (max_dur={args.chaos_max_dur}s, need >= 2s). Skipping chaos.")
+            report["chaos_test"] = {
+                "duration_min": 0,
+                "rounds": 0,
+                "result": "SKIP",
+                "reason": f"No durations <= {args.chaos_max_dur}s available",
+            }
         else:
             log.info(f"  Chaos files ready: {available_durations}s variants")
 
