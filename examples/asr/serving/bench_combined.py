@@ -613,78 +613,86 @@ async def main():
         available_durations = [d for d in chaos_durations if d in chaos_files and d <= args.chaos_max_dur]
         if not available_durations:
             log.error(f"  No chaos durations available (max_dur={args.chaos_max_dur}s, need >= 2s). Skipping chaos.")
+            report["chaos_test"] = {
+                "duration_min": 0,
+                "rounds": 0,
+                "result": "SKIP",
+                "reason": f"No durations <= {args.chaos_max_dur}s available",
+            }
         else:
             log.info(f"  Chaos files ready: {available_durations}s variants")
 
-        chaos_target = args.chaos_minutes * 60
-        chaos_t0 = time.monotonic()
-        chaos_batch_results = []
-        chaos_stream_results = []
-        chaos_vram_samples = []
-        chaos_round = 0
-        chaos_round_errors = 0
+            chaos_target = args.chaos_minutes * 60
+            chaos_t0 = time.monotonic()
+            chaos_batch_results = []
+            chaos_stream_results = []
+            chaos_vram_samples = []
+            chaos_round = 0
+            chaos_round_errors = 0
 
-        while available_durations and time.monotonic() - chaos_t0 < chaos_target:
-            chaos_round += 1
-            batch_count = max(1, int(20 * args.chaos_ratio))
-            stream_count = max(1, 20 - batch_count)
+            while time.monotonic() - chaos_t0 < chaos_target:
+                chaos_round += 1
+                batch_count = max(1, int(20 * args.chaos_ratio))
+                stream_count = max(1, 20 - batch_count)
 
-            batch_files = [chaos_files[random.choice(available_durations)] for _ in range(batch_count)]
-            stream_files_chaos = [chaos_files[random.choice(available_durations)] for _ in range(stream_count)]
+                batch_files = [chaos_files[random.choice(available_durations)] for _ in range(batch_count)]
+                stream_files_chaos = [chaos_files[random.choice(available_durations)] for _ in range(stream_count)]
 
-            batch_c = random.choice([4, 8, 16])
-            stream_c = random.choice([2, 4, 8])
+                batch_c = random.choice([4, 8, 16])
+                stream_c = random.choice([2, 4, 8])
 
-            try:
-                batch_res, stream_res, _ = await asyncio.wait_for(
-                    run_combined(batch_url, ws_url, batch_files, stream_files_chaos, batch_c, stream_c, args.chunk_ms),
-                    timeout=300,
-                )
-                chaos_batch_results.extend(batch_res)
-                chaos_stream_results.extend(stream_res)
-            except (asyncio.TimeoutError, Exception) as e:
-                chaos_round_errors += 1
-                log.warning(f"  Chaos round {chaos_round} error: {str(e)[:100]}")
+                try:
+                    batch_res, stream_res, _ = await asyncio.wait_for(
+                        run_combined(
+                            batch_url, ws_url, batch_files, stream_files_chaos, batch_c, stream_c, args.chunk_ms
+                        ),
+                        timeout=300,
+                    )
+                    chaos_batch_results.extend(batch_res)
+                    chaos_stream_results.extend(stream_res)
+                except (asyncio.TimeoutError, Exception) as e:
+                    chaos_round_errors += 1
+                    log.warning(f"  Chaos round {chaos_round} error: {str(e)[:100]}")
 
-            vram_used, _ = get_vram_mb()
-            elapsed_min = (time.monotonic() - chaos_t0) / 60
-            if vram_used is not None:
-                chaos_vram_samples.append((elapsed_min, vram_used))
+                vram_used, _ = get_vram_mb()
+                elapsed_min = (time.monotonic() - chaos_t0) / 60
+                if vram_used is not None:
+                    chaos_vram_samples.append((elapsed_min, vram_used))
 
-            if chaos_round % 10 == 0:
-                b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
-                s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
-                log.info(
-                    f"  Chaos round {chaos_round}: {elapsed_min:.1f} min, "
-                    f"VRAM={vram_used}MB, batch_fail={b_fail}, stream_fail={s_fail}, "
-                    f"round_errors={chaos_round_errors}"
-                )
+                if chaos_round % 10 == 0:
+                    b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
+                    s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
+                    log.info(
+                        f"  Chaos round {chaos_round}: {elapsed_min:.1f} min, "
+                        f"VRAM={vram_used}MB, batch_fail={b_fail}, stream_fail={s_fail}, "
+                        f"round_errors={chaos_round_errors}"
+                    )
 
-        chaos_wall = time.monotonic() - chaos_t0
-        chaos_b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
-        chaos_s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
-        chaos_total_fail = chaos_b_fail + chaos_s_fail + chaos_round_errors
+            chaos_wall = time.monotonic() - chaos_t0
+            chaos_b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
+            chaos_s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
+            chaos_total_fail = chaos_b_fail + chaos_s_fail + chaos_round_errors
 
-        report["chaos_test"] = {
-            "duration_min": round(chaos_wall / 60, 1),
-            "rounds": chaos_round,
-            "batch_ratio": args.chaos_ratio,
-            "duration_variants_s": available_durations,
-            "total_batch_requests": len(chaos_batch_results),
-            "total_stream_requests": len(chaos_stream_results),
-            "batch_failures": chaos_b_fail,
-            "stream_failures": chaos_s_fail,
-            "round_errors": chaos_round_errors,
-            "vram_samples": chaos_vram_samples,
-            "result": "FAIL" if chaos_total_fail > 0 else "PASS",
-        }
-        log.info(
-            f"  Chaos complete: {chaos_round} rounds, {chaos_wall/60:.1f} min, "
-            f"batch={len(chaos_batch_results)} ({chaos_b_fail} fail), "
-            f"stream={len(chaos_stream_results)} ({chaos_s_fail} fail), "
-            f"round_errors={chaos_round_errors} — "
-            f"{'FAIL' if chaos_total_fail > 0 else 'PASS'}"
-        )
+            report["chaos_test"] = {
+                "duration_min": round(chaos_wall / 60, 1),
+                "rounds": chaos_round,
+                "batch_ratio": args.chaos_ratio,
+                "duration_variants_s": available_durations,
+                "total_batch_requests": len(chaos_batch_results),
+                "total_stream_requests": len(chaos_stream_results),
+                "batch_failures": chaos_b_fail,
+                "stream_failures": chaos_s_fail,
+                "round_errors": chaos_round_errors,
+                "vram_samples": chaos_vram_samples,
+                "result": "FAIL" if chaos_total_fail > 0 else "PASS",
+            }
+            log.info(
+                f"  Chaos complete: {chaos_round} rounds, {chaos_wall/60:.1f} min, "
+                f"batch={len(chaos_batch_results)} ({chaos_b_fail} fail), "
+                f"stream={len(chaos_stream_results)} ({chaos_s_fail} fail), "
+                f"round_errors={chaos_round_errors} — "
+                f"{'FAIL' if chaos_total_fail > 0 else 'PASS'}"
+            )
 
     # ── Summary ──
     best_combined = max(combined_results, key=lambda x: x["batch"]["rps"] + x["stream"]["sess_per_min"])
