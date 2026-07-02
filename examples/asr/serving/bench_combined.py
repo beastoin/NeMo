@@ -11,11 +11,15 @@ Phases:
   1. Isolated baselines  — batch-only and stream-only (for comparison)
   2. Combined load       — batch and streaming concurrently at several mix ratios
   3. Sustained combined  — extended combined run to check stability
+  4. WER evaluation      — quality check under combined load
   5. Duration stress     — test with long audio files (30s–300s) to find OOM threshold
+  6. Soak test           — 20-min sustained load with VRAM leak detection via linear regression
+  7. Chaos test          — mixed traffic ratio (default 70/30 batch/stream) with random durations
 
 Usage:
     python3 bench_combined.py --server http://localhost:8000
-    python3 bench_combined.py --server http://localhost:8000 --batch-concurrency 16,32 --stream-concurrency 4,8
+    python3 bench_combined.py --server http://localhost:8000 --soak
+    python3 bench_combined.py --server http://localhost:8000 --chaos --chaos-minutes 10
     python3 bench_combined.py --server http://localhost:8000 --skip-baselines
 """
 
@@ -165,6 +169,21 @@ async def main():
         "--duration-targets", default="30,60,120,300", help="Target durations in seconds for stress test"
     )
     parser.add_argument("--duration-batch-c", default="1,4,8", help="Batch concurrency levels for duration sweep")
+    parser.add_argument(
+        "--soak", action="store_true", default=False, help="Run 20-min soak test with VRAM leak detection"
+    )
+    parser.add_argument("--soak-minutes", type=float, default=20.0, help="Soak test duration in minutes")
+    parser.add_argument("--soak-batch-c", type=int, default=16, help="Soak test batch concurrency")
+    parser.add_argument("--soak-stream-c", type=int, default=8, help="Soak test stream concurrency")
+    parser.add_argument(
+        "--soak-slope-gate", type=float, default=50.0, help="VRAM slope gate in MiB/min (above = leak)"
+    )
+    parser.add_argument("--chaos", action="store_true", default=False, help="Run chaos test with mixed traffic ratio")
+    parser.add_argument("--chaos-minutes", type=float, default=10.0, help="Chaos test duration in minutes")
+    parser.add_argument(
+        "--chaos-ratio", type=float, default=0.7, help="Batch fraction (0.7 = 70%% batch, 30%% stream)"
+    )
+    parser.add_argument("--chaos-max-dur", type=float, default=60.0, help="Max random audio duration for chaos test")
     parser.add_argument("--output", default="/tmp/bench_combined_report.json", help="Output JSON path")
     args = parser.parse_args()
 
@@ -480,6 +499,184 @@ async def main():
         }
         log.info(f"  Duration stress: max zero-fail duration = {max_ok_dur}s")
 
+    # ── Phase 6: Soak test ──
+    if args.soak:
+        log.info(
+            f"Phase 6: Soak test — {args.soak_minutes} min sustained, "
+            f"batch c={args.soak_batch_c}, stream c={args.soak_stream_c}"
+        )
+        soak_target = args.soak_minutes * 60
+        vram_samples = []
+        soak_batch_results = []
+        soak_stream_results = []
+        soak_failures = 0
+        soak_t0 = time.monotonic()
+
+        vram_used, vram_total = get_vram_mb()
+        if vram_used is not None:
+            vram_samples.append((0.0, vram_used))
+
+        soak_round = 0
+        while time.monotonic() - soak_t0 < soak_target:
+            soak_round += 1
+            batch_res, stream_res, _ = await run_combined(
+                batch_url, ws_url, wav_files, stream_wav_files, args.soak_batch_c, args.soak_stream_c, args.chunk_ms
+            )
+            soak_batch_results.extend(batch_res)
+            soak_stream_results.extend(stream_res)
+            b_fail = sum(1 for r in batch_res if r.get("status") != "ok")
+            s_fail = sum(1 for r in stream_res if r.get("status") != "ok")
+            soak_failures += b_fail + s_fail
+
+            elapsed_min = (time.monotonic() - soak_t0) / 60
+            vram_used, _ = get_vram_mb()
+            if vram_used is not None:
+                vram_samples.append((elapsed_min, vram_used))
+
+            if soak_round % 5 == 0:
+                log.info(
+                    f"  Soak round {soak_round}: {elapsed_min:.1f} min, "
+                    f"VRAM={vram_used}MB, failures={soak_failures}"
+                )
+
+        soak_wall = time.monotonic() - soak_t0
+
+        # Linear regression on VRAM samples
+        soak_slope = 0.0
+        soak_r2 = 0.0
+        soak_leak_detected = False
+        if len(vram_samples) >= 3:
+            xs = [s[0] for s in vram_samples]
+            ys = [s[1] for s in vram_samples]
+            n = len(xs)
+            x_mean = sum(xs) / n
+            y_mean = sum(ys) / n
+            ss_xy = sum((xs[i] - x_mean) * (ys[i] - y_mean) for i in range(n))
+            ss_xx = sum((xs[i] - x_mean) ** 2 for i in range(n))
+            ss_yy = sum((ys[i] - y_mean) ** 2 for i in range(n))
+            soak_slope = ss_xy / ss_xx if ss_xx > 0 else 0.0
+            soak_r2 = (ss_xy**2) / (ss_xx * ss_yy) if ss_xx > 0 and ss_yy > 0 else 0.0
+            soak_leak_detected = soak_slope > args.soak_slope_gate and soak_r2 > 0.3
+
+        soak_batch_summary = summarize_batch(soak_batch_results, soak_wall, args.soak_batch_c)
+        soak_stream_summary = summarize_stream(soak_stream_results, soak_wall, args.soak_stream_c)
+
+        report["soak_test"] = {
+            "duration_min": round(soak_wall / 60, 1),
+            "rounds": soak_round,
+            "batch_concurrency": args.soak_batch_c,
+            "stream_concurrency": args.soak_stream_c,
+            "total_requests": len(soak_batch_results) + len(soak_stream_results),
+            "total_failures": soak_failures,
+            "batch": soak_batch_summary,
+            "stream": soak_stream_summary,
+            "vram_samples": vram_samples,
+            "vram_slope_mb_per_min": round(soak_slope, 2),
+            "vram_r2": round(soak_r2, 4),
+            "slope_gate_mb_per_min": args.soak_slope_gate,
+            "leak_detected": soak_leak_detected,
+            "result": "FAIL" if soak_leak_detected or soak_failures > 0 else "PASS",
+        }
+        result_str = "FAIL (leak)" if soak_leak_detected else ("FAIL (failures)" if soak_failures > 0 else "PASS")
+        log.info(
+            f"  Soak complete: {soak_round} rounds, {soak_wall/60:.1f} min, "
+            f"slope={soak_slope:.1f} MiB/min (R²={soak_r2:.3f}), "
+            f"failures={soak_failures} — {result_str}"
+        )
+
+    # ── Phase 7: Chaos test ──
+    if args.chaos:
+        import random
+
+        log.info(
+            f"Phase 7: Chaos test — {args.chaos_minutes} min, "
+            f"ratio={args.chaos_ratio:.0%} batch / {1-args.chaos_ratio:.0%} stream"
+        )
+
+        long_dir = Path("/tmp/bench-chaos-wavs")
+        long_dir.mkdir(exist_ok=True)
+        source_files = sorted(wav_dir.glob("*.wav"))
+
+        chaos_durations = [2, 5, 10, 20, 30, 60]
+        chaos_files = {}
+        for dur in chaos_durations:
+            if dur <= 15:
+                matching = [f for f in source_files if abs(get_wav_duration(f) - dur) < dur * 0.5]
+                if matching:
+                    chaos_files[dur] = matching[0]
+                    continue
+            out_path = long_dir / f"chaos_{dur}s.wav"
+            if not out_path.exists():
+                create_long_wav(source_files, dur, out_path)
+            chaos_files[dur] = out_path
+
+        available_durations = [d for d in chaos_durations if d in chaos_files and d <= args.chaos_max_dur]
+        log.info(f"  Chaos files ready: {available_durations}s variants")
+
+        chaos_target = args.chaos_minutes * 60
+        chaos_t0 = time.monotonic()
+        chaos_batch_results = []
+        chaos_stream_results = []
+        chaos_vram_samples = []
+        chaos_round = 0
+
+        while time.monotonic() - chaos_t0 < chaos_target:
+            chaos_round += 1
+            batch_count = max(1, int(20 * args.chaos_ratio))
+            stream_count = max(1, 20 - batch_count)
+
+            batch_files = [chaos_files[random.choice(available_durations)] for _ in range(batch_count)]
+            stream_files_chaos = [chaos_files[random.choice(available_durations)] for _ in range(stream_count)]
+
+            batch_c = random.choice([4, 8, 16])
+            stream_c = random.choice([2, 4, 8])
+
+            try:
+                batch_res, stream_res, _ = await asyncio.wait_for(
+                    run_combined(batch_url, ws_url, batch_files, stream_files_chaos, batch_c, stream_c, args.chunk_ms),
+                    timeout=300,
+                )
+                chaos_batch_results.extend(batch_res)
+                chaos_stream_results.extend(stream_res)
+            except (asyncio.TimeoutError, Exception) as e:
+                log.warning(f"  Chaos round {chaos_round} error: {str(e)[:100]}")
+
+            vram_used, _ = get_vram_mb()
+            elapsed_min = (time.monotonic() - chaos_t0) / 60
+            if vram_used is not None:
+                chaos_vram_samples.append((elapsed_min, vram_used))
+
+            if chaos_round % 10 == 0:
+                b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
+                s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
+                log.info(
+                    f"  Chaos round {chaos_round}: {elapsed_min:.1f} min, "
+                    f"VRAM={vram_used}MB, batch_fail={b_fail}, stream_fail={s_fail}"
+                )
+
+        chaos_wall = time.monotonic() - chaos_t0
+        chaos_b_fail = sum(1 for r in chaos_batch_results if r.get("status") != "ok")
+        chaos_s_fail = sum(1 for r in chaos_stream_results if r.get("status") != "ok")
+
+        report["chaos_test"] = {
+            "duration_min": round(chaos_wall / 60, 1),
+            "rounds": chaos_round,
+            "batch_ratio": args.chaos_ratio,
+            "duration_variants_s": available_durations,
+            "total_batch_requests": len(chaos_batch_results),
+            "total_stream_requests": len(chaos_stream_results),
+            "batch_failures": chaos_b_fail,
+            "stream_failures": chaos_s_fail,
+            "vram_samples": chaos_vram_samples,
+            "result": "FAIL" if chaos_b_fail + chaos_s_fail > 0 else "PASS",
+        }
+        log.info(
+            f"  Chaos complete: {chaos_round} rounds, {chaos_wall/60:.1f} min, "
+            f"batch={len(chaos_batch_results)} ({chaos_b_fail} fail), "
+            f"stream={len(chaos_stream_results)} ({chaos_s_fail} fail) — "
+            f"{'FAIL' if chaos_b_fail + chaos_s_fail > 0 else 'PASS'}"
+        )
+
     # ── Summary ──
     best_combined = max(combined_results, key=lambda x: x["batch"]["rps"] + x["stream"]["sess_per_min"])
     zero_fail = [c for c in combined_results if c["batch"]["failures"] == 0 and c["stream"]["failures"] == 0]
@@ -637,6 +834,34 @@ async def main():
         ds = report.get("duration_stress_summary", {})
         print()
         print(f"**Max zero-fail duration:** {ds.get('max_zero_fail_duration_s', '?')}s")
+
+    if "soak_test" in report:
+        print()
+        print("### Soak Test (VRAM leak detection)")
+        st = report["soak_test"]
+        print(f"| Metric | Value |")
+        print(f"|--------|-------|")
+        print(f"| Duration | {st['duration_min']} min ({st['rounds']} rounds) |")
+        print(f"| Concurrency | batch c={st['batch_concurrency']}, stream c={st['stream_concurrency']} |")
+        print(f"| Total requests | {st['total_requests']} |")
+        print(f"| Total failures | {st['total_failures']} |")
+        print(f"| VRAM slope | {st['vram_slope_mb_per_min']} MiB/min (R²={st['vram_r2']}) |")
+        print(f"| Slope gate | < {st['slope_gate_mb_per_min']} MiB/min |")
+        print(f"| Leak detected | {st['leak_detected']} |")
+        print(f"| **Result** | **{st['result']}** |")
+
+    if "chaos_test" in report:
+        print()
+        print("### Chaos Test (mixed traffic ratio)")
+        ct = report["chaos_test"]
+        print(f"| Metric | Value |")
+        print(f"|--------|-------|")
+        print(f"| Duration | {ct['duration_min']} min ({ct['rounds']} rounds) |")
+        print(f"| Traffic ratio | {ct['batch_ratio']:.0%} batch / {1-ct['batch_ratio']:.0%} stream |")
+        print(f"| Duration variants | {ct['duration_variants_s']}s |")
+        print(f"| Batch requests | {ct['total_batch_requests']} ({ct['batch_failures']} failures) |")
+        print(f"| Stream requests | {ct['total_stream_requests']} ({ct['stream_failures']} failures) |")
+        print(f"| **Result** | **{ct['result']}** |")
 
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2)

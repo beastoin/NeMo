@@ -135,11 +135,12 @@ app = FastAPI(
 
 
 def _patch_ws_upgrade():
-    """Work around CUDA CachingHostAllocator corrupting interned byte constants.
+    """Defensive patch: use freshly allocated bytes in WebSocket upgrade requests.
 
-    GPU inference can corrupt Python's interned b" " (0x20 -> 0x00), breaking
-    WebSocket upgrade requests. We replace the affected method to use freshly
-    allocated bytes objects instead of interned constants.
+    GPU inference may corrupt Python byte constants used in HTTP request
+    construction. This replaces the affected method with one that builds
+    the request line from individually allocated bytes, avoiding any
+    dependency on interned single-byte constants.
     """
     import uvicorn.protocols.http.httptools_impl as _hi
 

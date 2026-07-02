@@ -108,6 +108,7 @@ class GPUWorker:
         self._running = True
         self._gc_interval = self._batch_cfg.get("gc_interval", 50)
         self._gc_counter = 0
+        self._max_stream_drain = max(1, int(self._stream_cfg.get("max_stream_drain", 16)))
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="gpu-worker")
         self._thread.start()
 
@@ -187,21 +188,13 @@ class GPUWorker:
         log.info("GPU worker thread stopped")
 
     def _run_single_mode(self) -> None:
-        log.info("Running in single-model mode (batched streaming)")
+        log.info(f"Running in single-model mode (batched streaming, max_stream_drain={self._max_stream_drain})")
         while self._running:
-            # Drain all pending stream chunks and batch them together
             stream_items = []
             non_chunk_item = None
-            try:
-                item = self._stream_queue.get_nowait()
-                if item.work_type == WorkType.STREAM_CHUNK:
-                    stream_items.append(item)
-                else:
-                    non_chunk_item = item
-            except queue.Empty:
-                pass
+            max_batch = min(self._stream_cfg.get("max_batch_size", 64), self._max_stream_drain)
 
-            max_batch = self._stream_cfg.get("max_batch_size", 64)
+            # Drain up to max_stream_drain stream chunks (fairness cap)
             while len(stream_items) < max_batch and non_chunk_item is None:
                 try:
                     item = self._stream_queue.get_nowait()
@@ -213,12 +206,16 @@ class GPUWorker:
                 except queue.Empty:
                     break
 
-            # Process batched stream chunks
             if stream_items:
-                self._dispatch_stream_batch(stream_items)
-                self._maybe_gc()
+                try:
+                    self._dispatch_stream_batch(stream_items)
+                except Exception as exc:
+                    log.exception(f"Stream batch dispatch failed: {exc}")
+                    for item in stream_items:
+                        item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                finally:
+                    self._maybe_gc()
 
-            # Process non-chunk stream items (open/close/shutdown)
             if non_chunk_item is not None:
                 if non_chunk_item.work_type == WorkType.SHUTDOWN:
                     break
@@ -228,19 +225,26 @@ class GPUWorker:
                 except Exception as exc:
                     non_chunk_item.loop.call_soon_threadsafe(self._safe_set_exception, non_chunk_item.future, exc)
 
-            # If no stream work, check batch queue
-            if not stream_items and non_chunk_item is None:
-                try:
-                    item = self._batch_queue.get(timeout=self._batch_poll_timeout)
-                except queue.Empty:
+            # Check batch queue — always check after processing stream work
+            # to prevent batch starvation under sustained stream load
+            batch_item = None
+            try:
+                if stream_items or non_chunk_item is not None:
+                    batch_item = self._batch_queue.get_nowait()
+                else:
+                    batch_item = self._batch_queue.get(timeout=self._batch_poll_timeout)
+            except queue.Empty:
+                if not stream_items and non_chunk_item is None:
                     continue
-                if item.work_type == WorkType.SHUTDOWN:
+
+            if batch_item is not None:
+                if batch_item.work_type == WorkType.SHUTDOWN:
                     break
                 try:
-                    result = self._dispatch(item)
-                    item.loop.call_soon_threadsafe(self._safe_set_result, item.future, result)
+                    result = self._dispatch(batch_item)
+                    batch_item.loop.call_soon_threadsafe(self._safe_set_result, batch_item.future, result)
                 except Exception as exc:
-                    item.loop.call_soon_threadsafe(self._safe_set_exception, item.future, exc)
+                    batch_item.loop.call_soon_threadsafe(self._safe_set_exception, batch_item.future, exc)
                 finally:
                     self._maybe_gc()
 
